@@ -117,9 +117,9 @@ A class has one current mode; rounds inherit the mode at generation time.
 - **Always upload `outputs/game.py` or the current session file** at start of deep-dive sessions.
 - **Use `ui.py` + `db.py` as the workspace** — most changes touch both.
 
-## User (Zach) preferences and style
+## User preferences and style
 
-- CS grad, works IT at a school district as contractor
+- CS grad
 - Strong design sense; catches subtle UX issues
 - Pushes back on over-engineering — prefers surgical fixes over architectural overhauls
 - Trusts gut calls; likes being asked about design choices with recommendations rather than open-ended "what do you think?"
