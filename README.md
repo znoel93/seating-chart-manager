@@ -89,4 +89,8 @@ First launch migrates any legacy DB found next to the script or executable.
 
 ## License
 
-_(Pick a license before making the repo public — see the LICENSE section of your README setup notes.)_
+All rights reserved. © 2026 Zach Noel.
+
+This software is distributed as a compiled application for free use by
+teachers. The source code is published publicly for transparency. If you
+want to use, modify, or redistribute the source code, please contact me.

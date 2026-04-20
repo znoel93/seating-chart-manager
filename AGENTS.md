@@ -128,7 +128,7 @@ A class has one current mode; rounds inherit the mode at generation time.
 
 ## Current status
 
-**Shipped:** v1.0.0 — first release to teachers at Zach's school via .dmg.
+**Shipped:** v1.0.0 — first release to teachers via .dmg.
 
 **Known remaining roadmap (optional, nothing urgent):**
 - Attendance persistence between round generations
