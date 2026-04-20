@@ -62,4 +62,5 @@ When a new version is released, you'll get a new `.dmg`. Drag the new app into A
 
 ---
 
-Questions? Contact [your name / email].
+Questions or bug reports? Open an issue at
+https://github.com/znoel93/seating-chart-manager/issues
