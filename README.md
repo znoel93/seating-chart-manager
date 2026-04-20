@@ -14,6 +14,32 @@ Built with Python + Tkinter + SQLite + integer linear programming (via PuLP), wi
 - **Class archive.** Archive old classes without deleting their data.
 - **18 themes.** From default to Retro Terminal to Notebook to Lab.
 
+## Screenshots
+
+The app opens to a simple home screen. Sidebar navigation switches between Classes, Layouts, and Settings.
+
+![Home page](docs/home_page.png)
+
+Each class has a roster tab with searchable student list, pair rules, bulk import, and three display modes for names (Full / First + L. / First only).
+
+![Class roster view](docs/class_roster_view.png)
+
+Generated rounds show both a Table List and a visual Room View. The "No repeated tablemates!" indicator flags when the optimizer finds a fresh assignment.
+
+![Example seating chart](docs/example_chart.png)
+
+The layout editor is drag-to-arrange. Tables and seats can be sized, rotated, and positioned freely. Layouts lock automatically once they've been used in a round, preserving historical integrity.
+
+![Layout editor](docs/layout_editor.png)
+
+The stats dashboard tracks pairing coverage over time, shows per-student pairing history, and includes a full N×N heatmap for spotting patterns.
+
+![Stats view](docs/stats_view.png)
+
+Eighteen themes, from clean Midnight (shown) and Chalk to playful Flower, focused Lab, and the monospace Retro Terminal.
+
+![Settings — themes](docs/settings.png)
+
 ## For teachers / end users
 
 See [INSTALL.md](INSTALL.md) for install instructions.
