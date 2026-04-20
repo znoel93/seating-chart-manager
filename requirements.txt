@@ -1,0 +1,19 @@
+# Runtime dependencies for Seating Chart Manager.
+#
+# Install with:
+#     pip3 install -r requirements.txt
+#
+# Python 3.10+ required (for modern type hint syntax).
+# Tkinter is part of the Python standard library — no pip install needed.
+
+# Integer linear programming solver used by the seating optimizer.
+# PuLP bundles a copy of CBC, so no external solver install is required.
+pulp>=2.7
+
+# PDF generation for seating-chart exports.
+reportlab>=4.0
+
+# Build-only dependency (used by build_app.sh / setup.py).
+# Not needed to run the app from source — only to produce a .app bundle.
+# Comment out or ignore if you're just running main.py directly.
+# py2app>=0.28

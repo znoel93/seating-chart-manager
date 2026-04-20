@@ -1,0 +1,48 @@
+# ── Python ────────────────────────────────────────────────────────
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+*.egg-info/
+.venv/
+venv/
+
+# ── Build artifacts (regenerable from source) ─────────────────────
+# py2app drops everything it builds into these two directories.
+# Fully regenerable by running ./build_app.sh — don't commit.
+build/
+dist/
+
+# Generated icon — regenerable from packaging/icon.svg via make_icns.sh.
+# The SVG source IS committed; the binary ICNS is not.
+packaging/AppIcon.icns
+packaging/AppIcon.iconset/
+
+# ── Local data ────────────────────────────────────────────────────
+# SQLite databases — these are user data, not source code.
+# Both the legacy next-to-script location and any stray test DBs.
+*.db
+*.db-journal
+*.sqlite
+*.sqlite3
+
+# ── macOS cruft ───────────────────────────────────────────────────
+.DS_Store
+.AppleDouble
+.LSOverride
+Icon?
+._*
+
+# ── Editor / IDE ──────────────────────────────────────────────────
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# ── Misc ──────────────────────────────────────────────────────────
+# Things people sometimes leave lying around
+*.log
+.env
+.env.local
