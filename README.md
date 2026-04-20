@@ -14,10 +14,6 @@ Built with Python + Tkinter + SQLite + integer linear programming (via PuLP), wi
 - **Class archive.** Archive old classes without deleting their data.
 - **18 themes.** From default to Retro Terminal to Notebook to Lab.
 
-## Screenshots
-
-_(Add screenshots here once you want to show the app off.)_
-
 ## For teachers / end users
 
 See [INSTALL.md](INSTALL.md) for install instructions.
