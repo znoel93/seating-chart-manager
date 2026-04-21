@@ -111,8 +111,6 @@ First launch migrates any legacy DB found next to the script or executable.
 
 ## License
 
-All rights reserved. © 2026 Zach Noel.
+MIT — see [LICENSE](LICENSE) for details.
 
-This software is distributed as a compiled application for free use by
-teachers. The source code is published publicly for transparency. If you
-want to use, modify, or redistribute the source code, please contact me.
+Copyright © 2026 Zach Noel.
