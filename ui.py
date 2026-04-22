@@ -580,13 +580,26 @@ class SeatingApp(tk.Tk):
         for w in self.content.winfo_children():
             w.destroy()
 
-    def _page_header(self, title, btn_text=None, btn_cmd=None):
+    def _page_header(self, title, btn_text=None, btn_cmd=None,
+                      secondary_actions=None):
+        """Render the standard page title bar. `btn_text`/`btn_cmd` is
+        the primary (accented) action on the right. `secondary_actions`
+        is an optional list of (text, command) tuples for ghost-style
+        buttons shown to the left of the primary action — used when a
+        page has multiple peer actions (e.g. Layouts has + New Layout
+        as primary and Import… as secondary)."""
         bar = tk.Frame(self.content, bg=theme.BG, pady=18, padx=28)
         bar.pack(fill="x")
         tk.Label(bar, text=title, font=theme.FONT_TITLE,
                  bg=theme.BG, fg=theme.TEXT).pack(side="left")
         if btn_text and btn_cmd:
             make_btn(bar, btn_text, btn_cmd, style="primary").pack(side="right")
+        if secondary_actions:
+            # Pack secondary actions right-to-left so they appear to the
+            # LEFT of the primary button in reading order.
+            for text, cmd in reversed(secondary_actions):
+                make_btn(bar, text, cmd, style="ghost").pack(
+                    side="right", padx=(0, 6))
         tk.Frame(self.content, bg=theme.SEP, height=1).pack(fill="x", padx=28)
 
     def _scrollable(self, parent):
@@ -2932,7 +2945,10 @@ class SeatingApp(tk.Tk):
         self._force_paint()
 
     def _build_layouts_ui(self, layouts: list):
-        self._page_header("Room Layouts", "+ New Layout", self._new_layout_dialog)
+        self._page_header(
+            "Room Layouts",
+            "+ New Layout", self._new_layout_dialog,
+            secondary_actions=[("↘ Import…", self._import_layout_dialog)])
         if not layouts:
             self._stop_spinner()
             tk.Label(self.content,
@@ -2979,6 +2995,9 @@ class SeatingApp(tk.Tk):
         make_btn(btns, "Duplicate",
                  lambda l=layout: self._duplicate_layout(l["id"]),
                  style="ghost").pack(side="left", padx=3)
+        make_btn(btns, "Export",
+                 lambda l=layout: self._export_layout(l["id"]),
+                 style="ghost").pack(side="left", padx=3)
         if not locked and not layout.get("_in_use", db.is_layout_in_use(layout["id"])):
             make_btn(btns, "Delete",
                      lambda l=layout: self._delete_layout(l["id"]),
@@ -3013,6 +3032,85 @@ class SeatingApp(tk.Tk):
             db.delete_layout(layout_id)
             self._invalidate_cache("layouts")
             self._show_layouts()
+
+    def _export_layout(self, layout_id):
+        """Save a layout to a .json file the user picks."""
+        import layout_io
+        from tkinter import filedialog
+
+        layout = db.get_layout(layout_id)
+        if layout is None:
+            return
+        # Default filename: slugified layout name, lowercased, with .json
+        # extension. Teacher can rename in the dialog if they want.
+        safe_name = "".join(
+            c if c.isalnum() or c in "-_ " else "_"
+            for c in layout["name"]
+        ).strip().replace(" ", "_") or "layout"
+        default_filename = f"{safe_name}.json"
+
+        path = filedialog.asksaveasfilename(
+            parent=self,
+            title=f"Export layout '{layout['name']}'",
+            defaultextension=".json",
+            initialfile=default_filename,
+            filetypes=[("Layout file", "*.json"), ("All files", "*.*")])
+        if not path:
+            return
+        try:
+            from pathlib import Path
+            layout_io.export_layout_to_path(layout_id, Path(path))
+        except Exception as e:
+            messagebox.showerror("Export Failed", str(e), parent=self)
+            return
+        messagebox.showinfo(
+            "Export Complete",
+            f"Layout '{layout['name']}' exported to:\n{path}",
+            parent=self)
+
+    def _import_layout_dialog(self):
+        """Import a previously-exported layout from a .json file."""
+        import layout_io
+        from tkinter import filedialog
+
+        path = filedialog.askopenfilename(
+            parent=self,
+            title="Import layout",
+            filetypes=[("Layout file", "*.json"), ("All files", "*.*")])
+        if not path:
+            return
+        try:
+            from pathlib import Path
+            new_id, final_name = layout_io.import_layout_from_path(Path(path))
+        except Exception as e:
+            messagebox.showerror("Import Failed", str(e), parent=self)
+            return
+
+        self._invalidate_cache("layouts")
+        # Inform the teacher, especially if the name was suffixed due
+        # to a collision — they should see why the imported layout
+        # has a different name than what they exported.
+        original_name = None
+        try:
+            import json
+            with open(path, "r", encoding="utf-8") as f:
+                original_name = json.load(f).get("layout", {}).get("name")
+        except Exception:
+            pass
+        if original_name and original_name != final_name:
+            messagebox.showinfo(
+                "Import Complete",
+                f"Imported as '{final_name}'.\n\n"
+                f"A layout named '{original_name}' already existed, "
+                "so the imported layout was renamed. You can rename "
+                "it further by duplicating or editing it.",
+                parent=self)
+        else:
+            messagebox.showinfo(
+                "Import Complete",
+                f"Imported layout '{final_name}'.",
+                parent=self)
+        self._show_layouts()
 
     def _open_layout_editor(self, layout_id, read_only=False):
         win = _LayoutEditorWindow(self, layout_id, read_only=read_only)

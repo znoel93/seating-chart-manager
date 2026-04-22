@@ -45,6 +45,8 @@ INCLUDES = [
     "room_canvas",
     "optimizer",
     "optimizer_table_mode",
+    "layout_io",
+    "seating_distribution",
 ]
 
 # Packages py2app would include but shouldn't — none in our case.

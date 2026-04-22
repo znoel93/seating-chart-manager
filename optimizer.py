@@ -119,6 +119,13 @@ def optimise_seating(
                     assignments=[], total_repeat_score=0,
                     status="Infeasible: two students pinned to the same seat")
             pin_seat_taken.add(s.pinned_seat_id)
+            # A seat-pinned student also counts toward their table's
+            # pin count, for force-fill target computation. Without
+            # this, force-fill could allocate too few seats to a
+            # table whose pinned-seat students still need to fit.
+            seat_table = seat_by_id[s.pinned_seat_id].table_id
+            pin_table_counts[seat_table] = (
+                pin_table_counts.get(seat_table, 0) + 1)
         elif s.pinned_table_id is not None:
             if s.pinned_table_id not in seats_by_table:
                 return SeatingResult(
@@ -131,6 +138,27 @@ def optimise_seating(
                 return SeatingResult(
                     assignments=[], total_repeat_score=0,
                     status="Infeasible: too many students pinned to one table")
+
+    # ── Compute balanced per-table targets ───────────────────────────────────
+    # Force-fill: pre-compute exact per-table student counts so the
+    # optimizer distributes evenly instead of leaving lonely students
+    # at otherwise-empty tables. Seat-level constraints (each seat used
+    # at most once, pins honored) remain in effect below; this target
+    # constraint is additive.
+    from seating_distribution import compute_table_targets, InfeasibleDistribution
+    tables_for_targets = [
+        (tid, len(seats_by_table[tid])) for tid in seats_by_table
+    ]
+    try:
+        targets = compute_table_targets(
+            num_students=len(students),
+            tables=tables_for_targets,
+            pin_counts=pin_table_counts,
+        )
+    except InfeasibleDistribution as e:
+        return SeatingResult(
+            assignments=[], total_repeat_score=0,
+            status=f"Infeasible: {e}")
 
     # ── Problem ──────────────────────────────────────────────────────────────
     prob = pulp.LpProblem("SeatingChart", pulp.LpMinimize)
@@ -249,6 +277,17 @@ def optimise_seating(
             for table_id, seat_list in seats_by_table.items():
                 prob += (pulp.lpSum(x[a][k] for k in seat_list) +
                          pulp.lpSum(x[b][k] for k in seat_list) <= 1)
+
+    # Force-fill: each table holds exactly `targets[tid]` students.
+    # Sum across all (student, seat-at-this-table) pairs must equal
+    # the target. This is additive to the per-seat <= 1 constraints
+    # above; together they distribute students evenly across tables
+    # while preventing seat collisions.
+    for tid, target_count in targets.items():
+        seat_list = seats_by_table.get(tid, [])
+        prob += pulp.lpSum(
+            x[s][k] for s in s_ids for k in seat_list
+        ) == target_count
 
     # ── Solve ────────────────────────────────────────────────────────────────
     import time

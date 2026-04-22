@@ -101,6 +101,24 @@ def optimise_seating(
                     status=(f"Infeasible: too many students pinned to "
                             f"table {s.pinned_table_id}"))
 
+    # ── Compute balanced per-table targets ───────────────────────────────────
+    # Force-fill: instead of letting the optimizer freely distribute
+    # students across tables (which would leave lonely students at
+    # near-empty tables when roster < total capacity), we pre-compute
+    # exact per-table counts and pass them as hard == constraints.
+    # The optimizer then only decides WHICH students go where.
+    from seating_distribution import compute_table_targets, InfeasibleDistribution
+    try:
+        targets = compute_table_targets(
+            num_students=len(students),
+            tables=[(t.id, t.capacity) for t in tables],
+            pin_counts=pin_table_counts,
+        )
+    except InfeasibleDistribution as e:
+        return SeatingResult(
+            assignments=[], total_repeat_score=0,
+            status=f"Infeasible: {e}")
+
     # ── Problem ──────────────────────────────────────────────────────────────
     prob = pulp.LpProblem("table_seating", pulp.LpMinimize)
 
@@ -126,9 +144,14 @@ def optimise_seating(
     for sid in s_ids:
         prob += pulp.lpSum(x[sid][tid] for tid in t_ids) == 1
 
-    # Each table respects its capacity
+    # Each table holds exactly its target count (force-fill). This is
+    # the key difference from the old <= capacity formulation — we
+    # know exactly how many students go to each table before solving,
+    # so the optimizer only decides WHICH students go where. Targets
+    # are capped by capacity at computation time, so this is always
+    # at least as tight as the old <= cap constraint.
     for tid in t_ids:
-        prob += pulp.lpSum(x[sid][tid] for sid in s_ids) <= t_cap[tid]
+        prob += pulp.lpSum(x[sid][tid] for sid in s_ids) == targets[tid]
 
     # Forbidden pairs: can't share any table
     s_id_set = set(s_ids)
