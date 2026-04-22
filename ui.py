@@ -996,6 +996,9 @@ class SeatingApp(tk.Tk):
             for w in (btn, inner_btn, name_lbl, sub_lbl):
                 w.bind("<Button-1>", lambda e, n=name: self._apply_timeout_preset(n))
 
+        # ── Data (backups + import/export) ────────────────────────────────────
+        self._build_data_section(body)
+
         # ── Reflow on resize ──────────────────────────────────────────────────
         # The content frame's <Configure> can fire with stale widths during
         # initial layout on macOS. The Text widget itself gets accurate
@@ -1121,6 +1124,338 @@ class SeatingApp(tk.Tk):
             except tk.TclError:
                 # Widgets already destroyed (e.g., user navigated away)
                 pass
+
+    # ── Data section (backups + import/export) ────────────────────────────────
+
+    def _build_data_section(self, body):
+        """Renders the 'Data' section at the bottom of Settings. Contains
+        manual/automatic backups (list + create/restore/delete) and
+        import/export controls. All actions route through backup.py —
+        this method is pure UI."""
+        import backup
+
+        section_label(body, "Data").pack(anchor="w", pady=(0, 6))
+        tk.Label(body,
+                 text="Back up your data periodically, or move it between "
+                      "computers with Export / Import. Automatic backups are "
+                      "created before risky actions (imports and restores).",
+                 font=theme.FONT_SMALL, bg=theme.BG, fg=theme.TEXT_DIM,
+                 anchor="w", justify="left", wraplength=600).pack(
+                     anchor="w", pady=(0, 14), fill="x")
+
+        # Action buttons row: Create backup, Export, Import
+        actions = tk.Frame(body, bg=theme.BG)
+        actions.pack(anchor="w", fill="x", pady=(0, 18))
+        make_btn(actions, "📦 Create backup…",
+                 self._create_backup_dialog, style="primary",
+                 padx=14, pady=8).pack(side="left", padx=(0, 8))
+        make_btn(actions, "↗ Export data…",
+                 self._export_data_dialog, style="ghost",
+                 padx=14, pady=8).pack(side="left", padx=(0, 8))
+        make_btn(actions, "↘ Import data…",
+                 self._import_data_dialog, style="ghost",
+                 padx=14, pady=8).pack(side="left")
+
+        # Saved backups list
+        tk.Label(body, text="Saved backups",
+                 font=theme.FONT_BOLD, bg=theme.BG, fg=theme.TEXT,
+                 anchor="w").pack(anchor="w", pady=(4, 4))
+
+        self._backup_list_frame = tk.Frame(body, bg=theme.BG)
+        self._backup_list_frame.pack(anchor="w", fill="x", pady=(0, 8))
+        self._render_backup_list()
+
+    def _render_backup_list(self):
+        """Populate the backup list container. Called initially and
+        after any operation that changes the backup folder contents.
+
+        Preserves the settings-page scroll position across the rebuild
+        of the backup card list. The trick: we snapshot an ABSOLUTE
+        pixel offset (viewport top Y relative to the content frame's
+        origin), not a fraction. Fractions fail when content below the
+        viewport is removed because "87% of shorter page" lands at a
+        different absolute position than "87% of longer page." Pixel
+        offsets stay meaningful — Tk automatically clamps to the new
+        content bounds, so if the user was at the bottom before, they
+        stay at the bottom after.
+        """
+        import backup
+
+        frame = getattr(self, "_backup_list_frame", None)
+        if frame is None or not frame.winfo_exists():
+            return
+
+        # Snapshot the viewport's absolute pixel offset. Computed as
+        # (top_fraction × total_content_height) before rebuild.
+        scroll_text = getattr(self, "_settings_scroll_text", None)
+        pixel_offset = None
+        if scroll_text is not None:
+            try:
+                if scroll_text.winfo_exists():
+                    scroll_text.update_idletasks()
+                    top_frac, _ = scroll_text.yview()
+                    # The content frame lives inside the Text widget; its
+                    # full height (winfo_height on the Text's one embedded
+                    # child frame) is the total scrollable content height.
+                    # Fall back to the Text's own bbox if that's unavailable.
+                    content_h = 0
+                    for name in scroll_text.window_names():
+                        try:
+                            w = scroll_text.nametowidget(name)
+                            if w.winfo_exists():
+                                content_h = max(content_h, w.winfo_height())
+                        except (tk.TclError, KeyError):
+                            pass
+                    if content_h > 0:
+                        pixel_offset = int(top_frac * content_h)
+            except tk.TclError:
+                pixel_offset = None
+
+        for w in frame.winfo_children():
+            w.destroy()
+
+        try:
+            entries = backup.list_backups()
+        except Exception as e:
+            tk.Label(frame, text=f"Could not read backups folder: {e}",
+                     font=theme.FONT_SMALL, bg=theme.BG, fg=theme.TEXT_MUTED,
+                     anchor="w").pack(anchor="w")
+        else:
+            if not entries:
+                tk.Label(frame,
+                         text="No backups yet. Create one above, or import/restore "
+                              "from an existing file to auto-generate your first one.",
+                         font=theme.FONT_SMALL, bg=theme.BG, fg=theme.TEXT_MUTED,
+                         anchor="w", justify="left", wraplength=600).pack(
+                             anchor="w", pady=(2, 0), fill="x")
+            else:
+                for e in entries:
+                    self._render_backup_row(frame, e)
+
+        # Restore the pixel offset as a fraction of the NEW content
+        # height. Scheduled via after_idle so Tk has finished laying
+        # out the new content and `winfo_height()` returns the
+        # post-reflow size. If the offset is past the new end, Tk's
+        # yview_moveto clamps automatically — that's why "scrolled to
+        # the bottom" stays at the bottom even after the page shrinks.
+        if pixel_offset is not None and scroll_text is not None:
+            def _restore():
+                try:
+                    if not scroll_text.winfo_exists():
+                        return
+                    scroll_text.update_idletasks()
+                    new_h = 0
+                    for name in scroll_text.window_names():
+                        try:
+                            w = scroll_text.nametowidget(name)
+                            if w.winfo_exists():
+                                new_h = max(new_h, w.winfo_height())
+                        except (tk.TclError, KeyError):
+                            pass
+                    if new_h > 0:
+                        new_frac = min(1.0, pixel_offset / new_h)
+                        scroll_text.yview_moveto(new_frac)
+                except tk.TclError:
+                    pass
+            scroll_text.after_idle(_restore)
+
+    def _render_backup_row(self, parent, entry: dict):
+        """Render one backup card. Entry dict comes from list_backups()."""
+        import backup
+
+        card = tk.Frame(parent, bg=theme.PANEL,
+                         highlightbackground=theme.BORDER,
+                         highlightthickness=1)
+        card.pack(fill="x", pady=(0, 6))
+        inner = tk.Frame(card, bg=theme.PANEL, padx=14, pady=10)
+        inner.pack(fill="x")
+
+        # Left column: icon + description
+        left = tk.Frame(inner, bg=theme.PANEL)
+        left.pack(side="left", fill="x", expand=True)
+
+        title_row = tk.Frame(left, bg=theme.PANEL)
+        title_row.pack(anchor="w", fill="x")
+        icon = "📦" if entry["type"] == "manual" else "🕐"
+        label = entry["label"] if entry["label"] else (
+            "Automatic backup" if entry["type"] == "auto" else "Backup")
+        # Convert slug back to readable form (hyphens → spaces) for display
+        display_label = label.replace("-", " ") if entry["label"] else label
+        tk.Label(title_row, text=f"{icon}  {display_label}",
+                 font=theme.FONT_BOLD, bg=theme.PANEL,
+                 fg=theme.TEXT, anchor="w").pack(side="left")
+
+        # Meta row: type · timestamp · size
+        kind = "Manual" if entry["type"] == "manual" else "Automatic"
+        when = backup.format_timestamp(entry.get("timestamp"))
+        size = backup.format_size(entry.get("size_bytes", 0))
+        meta = f"{kind}  ·  {when}  ·  {size}"
+        tk.Label(left, text=meta,
+                 font=theme.FONT_SMALL, bg=theme.PANEL,
+                 fg=theme.TEXT_DIM, anchor="w").pack(anchor="w", pady=(2, 2))
+
+        # Preview row: contents (classes/rounds/students) or error
+        preview = entry.get("preview", {})
+        if "error" in preview:
+            preview_text = f"⚠ {preview['error']}"
+            preview_fg = theme.TEXT_MUTED
+        else:
+            c = preview.get("classes", 0)
+            r = preview.get("rounds", 0)
+            s = preview.get("students", 0)
+            preview_text = (f"{c} class{'es' if c != 1 else ''}  ·  "
+                             f"{r} round{'s' if r != 1 else ''}  ·  "
+                             f"{s} student{'s' if s != 1 else ''}")
+            preview_fg = theme.TEXT_DIM
+        tk.Label(left, text=preview_text,
+                 font=theme.FONT_SMALL, bg=theme.PANEL,
+                 fg=preview_fg, anchor="w").pack(anchor="w")
+
+        # Right column: action buttons. Only enable Restore if the
+        # preview succeeded — a broken backup shouldn't look restorable.
+        right = tk.Frame(inner, bg=theme.PANEL)
+        right.pack(side="right")
+        can_restore = "error" not in preview
+        if can_restore:
+            make_btn(right, "↺ Restore",
+                     lambda fn=entry["filename"], lbl=display_label:
+                         self._restore_backup_dialog(fn, lbl),
+                     style="ghost", padx=12, pady=6).pack(side="left", padx=(0, 6))
+        make_btn(right, "🗑 Delete",
+                 lambda fn=entry["filename"], lbl=display_label:
+                     self._delete_backup_dialog(fn, lbl),
+                 style="ghost", padx=12, pady=6).pack(side="left")
+
+    def _create_backup_dialog(self):
+        """Prompt for an optional label, then snapshot the live DB."""
+        import backup
+        from tkinter import simpledialog
+        label = simpledialog.askstring(
+            "Create Backup",
+            "Name this backup (optional):",
+            parent=self)
+        # simpledialog returns None if cancelled — skip; empty string is
+        # also fine, just means no label.
+        if label is None:
+            return
+        try:
+            path = backup.create_manual_backup(label or "")
+        except Exception as e:
+            messagebox.showerror("Backup Failed", str(e), parent=self)
+            return
+        self._render_backup_list()
+        messagebox.showinfo(
+            "Backup Created",
+            f"Backup saved as:\n{path.name}",
+            parent=self)
+
+    def _restore_backup_dialog(self, filename: str, display_label: str):
+        """Confirm and execute a restore from the named backup."""
+        import backup
+        proceed = messagebox.askyesno(
+            "Restore from Backup?",
+            f"Restore from “{display_label}”?\n\n"
+            "This will replace all your current data with the contents "
+            "of this backup.\n\n"
+            "A backup of your current data will be created automatically "
+            "first, so you can undo this if needed.",
+            parent=self)
+        if not proceed:
+            return
+        try:
+            auto_path = backup.restore_from_backup(filename)
+        except Exception as e:
+            messagebox.showerror("Restore Failed", str(e), parent=self)
+            return
+        # After the DB has been replaced, rebuild the whole app so every
+        # view re-queries fresh. rebuild() destroys all widgets (including
+        # any open Toplevels) and re-creates the root UI from scratch.
+        self._invalidate_cache("classes", "layouts")
+        messagebox.showinfo(
+            "Restore Complete",
+            f"Your data has been restored.\n\n"
+            f"Your previous data was automatically saved as:\n"
+            f"{auto_path.name if auto_path else '(no prior data to back up)'}",
+            parent=self)
+        self._rebuild_preserving_settings_scroll()
+
+    def _delete_backup_dialog(self, filename: str, display_label: str):
+        """Confirm and delete a backup."""
+        import backup
+        proceed = messagebox.askyesno(
+            "Delete Backup?",
+            f"Delete “{display_label}”?\n\nThis cannot be undone.",
+            parent=self)
+        if not proceed:
+            return
+        try:
+            backup.delete_backup(filename)
+        except Exception as e:
+            messagebox.showerror("Delete Failed", str(e), parent=self)
+            return
+        self._render_backup_list()
+
+    def _export_data_dialog(self):
+        """Save the live DB to a user-chosen path."""
+        import backup
+        from tkinter import filedialog
+        from datetime import datetime
+        default_name = f"SeatingChartManager_backup_{datetime.now().strftime('%Y-%m-%d')}.db"
+        path = filedialog.asksaveasfilename(
+            parent=self,
+            title="Export data",
+            defaultextension=".db",
+            initialfile=default_name,
+            filetypes=[("Seating Chart backup", "*.db"), ("All files", "*.*")])
+        if not path:
+            return
+        try:
+            from pathlib import Path
+            backup.export_to_path(Path(path))
+        except Exception as e:
+            messagebox.showerror("Export Failed", str(e), parent=self)
+            return
+        messagebox.showinfo(
+            "Export Complete",
+            f"Data exported to:\n{path}",
+            parent=self)
+
+    def _import_data_dialog(self):
+        """Let the user pick a .db file, validate it, and import it."""
+        import backup
+        from tkinter import filedialog
+        path = filedialog.askopenfilename(
+            parent=self,
+            title="Import data",
+            filetypes=[("Seating Chart backup", "*.db"), ("All files", "*.*")])
+        if not path:
+            return
+        # Same replace-everything confirmation as restore. Wording is
+        # slightly different because the source is an external file the
+        # user just picked, not a named saved backup.
+        proceed = messagebox.askyesno(
+            "Import Data?",
+            "Replace your current data with the contents of the selected "
+            "file?\n\n"
+            "A backup of your current data will be created automatically "
+            "first, so you can undo this if needed.",
+            parent=self)
+        if not proceed:
+            return
+        try:
+            from pathlib import Path
+            auto_path = backup.import_from_path(Path(path))
+        except Exception as e:
+            messagebox.showerror("Import Failed", str(e), parent=self)
+            return
+        self._invalidate_cache("classes", "layouts")
+        messagebox.showinfo(
+            "Import Complete",
+            f"Data imported from:\n{path}\n\n"
+            f"Your previous data was automatically saved as:\n"
+            f"{auto_path.name if auto_path else '(no prior data to back up)'}",
+            parent=self)
+        self._rebuild_preserving_settings_scroll()
 
     # ── Classes ───────────────────────────────────────────────────────────────
 

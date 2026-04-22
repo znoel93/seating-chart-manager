@@ -25,13 +25,14 @@ This document orients an AI assistant (Claude, etc.) to the Seating Chart Manage
 ```
 seating_app/
 ├── main.py                    # Entry point — just launches SeatingApp from ui.py
-├── ui.py                      # ~7400 lines. ALL Tkinter UI, main window, dialogs, views
-├── db.py                      # ~1460 lines. SQLite schema, queries, migrations
+├── ui.py                      # ~7700 lines. ALL Tkinter UI, main window, dialogs, views
+├── db.py                      # ~1565 lines. SQLite schema, queries, migrations
 ├── theme.py                   # 18 theme palettes + fonts
 ├── room_canvas.py             # ~1020 lines. Drag-to-arrange room layout widget
 ├── optimizer.py               # Per-seat ILP optimizer (PuLP)
 ├── optimizer_table_mode.py    # Per-table ILP optimizer (PuLP)
 ├── exporter.py                # PDF generation (ReportLab) — table list + room view
+├── backup.py                  # Backup/restore + import/export for the live DB
 ├── setup.py                   # py2app build config
 ├── build_app.sh               # One-command build → dmg
 ├── packaging/
@@ -110,6 +111,23 @@ A class has one current mode; rounds inherit the mode at generation time.
 - Parser handles `"Last, First"`, `"First Last"`, mononyms
 - Multi-word first/last names preserved ("Billy Bob Thornton", "Jon Van Der Berg")
 
+### Backup + Import/Export
+- Lives in `backup.py` — pure logic module. No Tk dependencies.
+- Settings page has a "Data" section with manual backup creation, a
+  list of saved backups (with restore/delete per row), and
+  Import/Export buttons.
+- Backups stored at `<user_data_dir>/backups/` as `.db` files. Filename
+  convention: `{manual|auto}_{YYYY-MM-DD_HHMMSS}[_{label}].db`
+- Auto-backups fire before any import or restore, capped at 5 (oldest
+  rotates out). Manual backups uncapped.
+- Import validates the source file has expected tables before touching
+  the live DB. After restore/import, calls `self.rebuild()` to tear
+  down all widgets (including open Toplevels) and re-render from Home
+  with fresh DB contents.
+- No persistent SQLite connection in the app — every query opens and
+  closes its own via `get_connection()`. This is what makes the file-
+  replace-then-rebuild pattern safe without connection management.
+
 ## Dev habits
 
 - **Run the tuple-in-constructor scanner after any UI edit.** Script in BUILD.md.
@@ -117,9 +135,9 @@ A class has one current mode; rounds inherit the mode at generation time.
 - **Always upload `outputs/game.py` or the current session file** at start of deep-dive sessions.
 - **Use `ui.py` + `db.py` as the workspace** — most changes touch both.
 
-## User preferences and style
+## User (Zach) preferences and style
 
-- CS grad
+- CS grad, works IT at a school district as contractor
 - Strong design sense; catches subtle UX issues
 - Pushes back on over-engineering — prefers surgical fixes over architectural overhauls
 - Trusts gut calls; likes being asked about design choices with recommendations rather than open-ended "what do you think?"
@@ -128,12 +146,25 @@ A class has one current mode; rounds inherit the mode at generation time.
 
 ## Current status
 
-**Shipped:** v1.0.0 — first release to teachers via .dmg.
+**Shipped:** v1.0.0 — first release to teachers at Zach's school via .dmg.
 
-**Known remaining roadmap (optional, nothing urgent):**
+**In progress / next release:**
+- Backup/Restore + Import/Export (complete, pending ship as v1.1.0)
+
+**Planned next:**
+- Individual layout export/import (JSON format, self-contained)
+- Dynamic averaged force-fill for lonely student problem (hard
+  constraint on per-table counts; target = N // tables, remainder
+  distributed to larger tables first)
+- Generalized tag system with four operations (distribute evenly /
+  cluster together / keep apart / ignore) for compositional constraints
+  like gender mixing, ability mixing, energy level, etc.
+
+**Deferred / optional:**
 - Attendance persistence between round generations
 - PNG / printable HTML export (on-demand only)
 - PowerSchool CSV import improvements (blocked on sample file)
+- Individual class export (complicated; defer until a real user needs it)
 
 **Permanent backlog notes:** anything grab-bag unless real-use friction surfaces.
 

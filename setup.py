@@ -27,7 +27,9 @@ DATA_FILES = []
 # Python packages that py2app might not detect automatically. py2app
 # walks imports from main.py and generally catches everything, but
 # pulp's solvers and reportlab's dynamic registration can sometimes
-# slip through — list them explicitly to be safe.
+# slip through — list them explicitly to be safe. Local modules that
+# are imported lazily inside methods (rather than at module top) can
+# also be missed, so we list ours explicitly.
 INCLUDES = [
     "pulp",
     "pulp.apis",
@@ -35,6 +37,14 @@ INCLUDES = [
     "reportlab.pdfgen",
     "reportlab.lib",
     "reportlab.platypus",
+    # Local modules (imported lazily inside methods in some cases)
+    "backup",
+    "db",
+    "theme",
+    "exporter",
+    "room_canvas",
+    "optimizer",
+    "optimizer_table_mode",
 ]
 
 # Packages py2app would include but shouldn't — none in our case.
