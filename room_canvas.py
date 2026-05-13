@@ -24,7 +24,7 @@ import db
 import theme
 
 GRID_SNAP   = 20
-SEAT_RADIUS = 16
+SEAT_RADIUS = 22
 FRONT_H     = 36
 PADDING     = 16
 MIN_CANVAS_W = 800
@@ -55,12 +55,29 @@ def _rotate_point(px: float, py: float, angle_deg: float) -> tuple:
 # "Avery Lynne" → "Avery" / "Lynne" full legibility.
 def _fit_name_to_seat(name: str) -> tuple[str, int, int]:
     """Return (display_text, font_pt, line_count) for rendering `name`
-    inside a seat circle."""
+    inside a seat circle.
+
+    Sized for SEAT_RADIUS=22 (44px diameter). Limits + fonts match the
+    PDF exporter's _fit_name_to_seat_pdf so the in-app room view and the
+    printed PDF look consistent.
+
+    Helvetica width at 11pt is ~6px/char average, so ~6-7 chars per
+    line is the realistic fit inside a 44px-diameter circle minus
+    padding. Limits are slightly generous since most students have
+    short last names (and these are mid-line trimmed only as a fallback).
+
+    Sizing rules:
+      - ≤9 chars → 1 line at 11pt
+      - has whitespace → 2 lines at 9pt
+      - long single word → truncate at 9 chars with ellipsis
+    """
     # Strip excess whitespace
     name = name.strip()
-    if len(name) <= 9:
+    SINGLE_LIMIT = 9
+    LINE_LIMIT   = 9
+    if len(name) <= SINGLE_LIMIT:
         # Fits comfortably on one line
-        return name, 8, 1
+        return name, 11, 1
     if " " in name:
         # Split at the space that best balances the two halves.
         words = name.split()
@@ -80,15 +97,14 @@ def _fit_name_to_seat(name: str) -> tuple[str, int, int]:
                     best_split = i
             line1 = " ".join(words[:best_split])
             line2 = " ".join(words[best_split:])
-        # If either line is still too long for the seat (>11 chars at 7pt),
-        # truncate it. Otherwise render as-is.
-        if len(line1) > 9:
-            line1 = line1[:8] + "…"
-        if len(line2) > 9:
-            line2 = line2[:8] + "…"
-        return f"{line1}\n{line2}", 7, 2
+        # Per-line truncation if a single half is still too long
+        if len(line1) > LINE_LIMIT:
+            line1 = line1[:LINE_LIMIT - 1] + "…"
+        if len(line2) > LINE_LIMIT:
+            line2 = line2[:LINE_LIMIT - 1] + "…"
+        return f"{line1}\n{line2}", 9, 2
     # Single long word — truncate
-    return name[:9] + "…", 8, 1
+    return name[:LINE_LIMIT - 1] + "…", 11, 1
 
 
 class RoomCanvas(tk.Frame):
@@ -541,9 +557,9 @@ class RoomCanvas(tk.Frame):
         if self.mode in ("view", "assign") and student:
             # Name rendering inside the seat circle. Try to show full names
             # when they fit. Strategy:
-            #   Short (≤9 chars)  → single line, 8pt bold
-            #   Has whitespace    → split at balance point, two lines, 7pt
-            #   Long single word  → truncate with ellipsis, 8pt bold
+            #   Short (≤9 chars)  → single line, 11pt bold
+            #   Has whitespace    → split at balance point, two lines, 9pt
+            #   Long single word  → truncate with ellipsis, 11pt bold
             fg = theme.ACCENT_TEXT if (self.mode == "assign" and
                                         s["id"] == self.selected_seat_id) else theme.STUDENT_FG
             display, font_size, lines = _fit_name_to_seat(student)

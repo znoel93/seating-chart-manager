@@ -277,6 +277,104 @@ def init_db():
                 key     TEXT PRIMARY KEY,
                 value   TEXT NOT NULL
             );
+
+            -- ── Phase 3: Activities ──────────────────────────────────────────
+            -- Activities are a class-level concept, parallel to layouts. A
+            -- class can define any number of activities (tutoring, shadowing,
+            -- classroom helper, etc.) and then generate activity rounds that
+            -- assign students to them. Activities are orthogonal to seating;
+            -- a class can use seating rounds, activity rounds, both, or
+            -- neither.
+            CREATE TABLE IF NOT EXISTS activities (
+                id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                class_id    INTEGER NOT NULL REFERENCES classes(id) ON DELETE CASCADE,
+                name        TEXT NOT NULL,
+                capacity    INTEGER NOT NULL CHECK(capacity >= 0),
+                description TEXT NOT NULL DEFAULT '',
+                archived    INTEGER NOT NULL DEFAULT 0,
+                sort_order  INTEGER NOT NULL DEFAULT 0,
+                UNIQUE (class_id, name)
+            );
+
+            -- Activity rounds: a single "week" of activity assignments.
+            -- Parallel to the rounds table for seating.
+            CREATE TABLE IF NOT EXISTS activity_rounds (
+                id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+                class_id            INTEGER NOT NULL REFERENCES classes(id) ON DELETE CASCADE,
+                label               TEXT NOT NULL,
+                created_at          TEXT NOT NULL,
+                excluded_activities TEXT NOT NULL DEFAULT '[]',
+                repeat_score        INTEGER NOT NULL DEFAULT 0,
+                notes               TEXT NOT NULL DEFAULT '',
+                edited              INTEGER NOT NULL DEFAULT 0
+            );
+
+            -- Which student went to which activity for a given round.
+            CREATE TABLE IF NOT EXISTS activity_assignments (
+                id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                round_id    INTEGER NOT NULL REFERENCES activity_rounds(id) ON DELETE CASCADE,
+                student_id  INTEGER NOT NULL REFERENCES students(id) ON DELETE CASCADE,
+                activity_id INTEGER NOT NULL REFERENCES activities(id) ON DELETE CASCADE
+            );
+
+            -- Per-student, per-activity exclusions. A row here means the
+            -- student is NEVER assignable to this activity (e.g. "Alice
+            -- cannot do tutoring"). Enforced as a hard constraint by the
+            -- activity optimizer.
+            CREATE TABLE IF NOT EXISTS activity_exclusions (
+                id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                student_id  INTEGER NOT NULL REFERENCES students(id) ON DELETE CASCADE,
+                activity_id INTEGER NOT NULL REFERENCES activities(id) ON DELETE CASCADE,
+                UNIQUE (student_id, activity_id)
+            );
+
+            -- ── Phase 4: Student Tag System ──────────────────────────────────
+            -- Tags decorate students with structured labels that influence how
+            -- optimizers group them. A tag CATEGORY (e.g. "Reading Level") has
+            -- an OPERATION telling the optimizer what to do with students
+            -- sharing a value: distribute evenly across groups, cluster
+            -- together in the same group, keep apart in different groups, or
+            -- ignore (tag exists but doesn't affect optimization).
+            --
+            -- All operations are SOFT constraints — they add cost to the
+            -- optimizer's objective but never cause infeasibility. This
+            -- differs from pins/exclusions which are hard per-student rules,
+            -- and from never-together pair rules which are hard per-pair.
+            -- Teachers who need a HARD rule should use pair rules instead.
+            CREATE TABLE IF NOT EXISTS student_tag_categories (
+                id         INTEGER PRIMARY KEY AUTOINCREMENT,
+                class_id   INTEGER NOT NULL REFERENCES classes(id) ON DELETE CASCADE,
+                name       TEXT NOT NULL,
+                operation  TEXT NOT NULL DEFAULT 'ignore'
+                             CHECK(operation IN ('distribute','cluster',
+                                                  'keep_apart','ignore')),
+                sort_order INTEGER NOT NULL DEFAULT 0,
+                UNIQUE (class_id, name)
+            );
+
+            -- Allowed values within a tag category (e.g. "advanced",
+            -- "on-grade", "support" under the "Reading Level" category).
+            -- Optional color hint for display — teachers can color-code
+            -- values to match any offline tools they already use.
+            CREATE TABLE IF NOT EXISTS student_tag_values (
+                id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                category_id INTEGER NOT NULL REFERENCES student_tag_categories(id) ON DELETE CASCADE,
+                value       TEXT NOT NULL,
+                color       TEXT,
+                sort_order  INTEGER NOT NULL DEFAULT 0,
+                UNIQUE (category_id, value)
+            );
+
+            -- Assignment of tag values to students. A student can have tag
+            -- values across many categories but typically one value per
+            -- category (enforced by UI, not DB — leaves flexibility for
+            -- edge cases like dual enrollment if ever needed).
+            CREATE TABLE IF NOT EXISTS student_tags (
+                id         INTEGER PRIMARY KEY AUTOINCREMENT,
+                student_id INTEGER NOT NULL REFERENCES students(id) ON DELETE CASCADE,
+                value_id   INTEGER NOT NULL REFERENCES student_tag_values(id) ON DELETE CASCADE,
+                UNIQUE (student_id, value_id)
+            );
         """)
         # Migration: add repeat_score to existing DBs that predate this column
         cols = [r[1] for r in conn.execute("PRAGMA table_info(rounds)").fetchall()]
@@ -421,6 +519,106 @@ def init_db():
                     "SELECT id, capacity, width, height, shape FROM tables"
                 ).fetchall():
                     _seed_default_seats(conn, row[0], row[1], row[2], row[3], row[4])
+
+        # ── Phase 3 migrations ──────────────────────────────────────────────
+        # New column on classes: pair_history_mode controls whether
+        # pair-history counts are combined across seating + activity
+        # rounds ('combined') or kept separate ('separate'). Default
+        # 'combined' matches the simpler mental model — Alice has been
+        # grouped with Bob N times — which is what most teachers want.
+        ccols = [r[1] for r in conn.execute("PRAGMA table_info(classes)").fetchall()]
+        if "pair_history_mode" not in ccols:
+            conn.execute(
+                "ALTER TABLE classes ADD COLUMN pair_history_mode TEXT NOT NULL "
+                "DEFAULT 'combined'"
+            )
+        # New column on students: pinned_activity_id. A student may be
+        # pinned to an activity independently of their seating pin; the
+        # two are used in different round types and don't conflict.
+        scols = [r[1] for r in conn.execute("PRAGMA table_info(students)").fetchall()]
+        if "pinned_activity_id" not in scols:
+            conn.execute(
+                "ALTER TABLE students ADD COLUMN pinned_activity_id INTEGER "
+                "REFERENCES activities(id) ON DELETE SET NULL"
+            )
+        # Ensure new Phase 3 tables exist for upgraded DBs too. The CREATE
+        # block in the main executescript() above handles fresh DBs, but
+        # SQLite's execscript is all-or-nothing per-statement; if the block
+        # partially ran on a previous version, idempotent CREATE IF NOT
+        # EXISTS here catches any gaps.
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS activities (
+                id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                class_id    INTEGER NOT NULL REFERENCES classes(id) ON DELETE CASCADE,
+                name        TEXT NOT NULL,
+                capacity    INTEGER NOT NULL CHECK(capacity >= 0),
+                description TEXT NOT NULL DEFAULT '',
+                archived    INTEGER NOT NULL DEFAULT 0,
+                sort_order  INTEGER NOT NULL DEFAULT 0,
+                UNIQUE (class_id, name)
+            )
+        """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS activity_rounds (
+                id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+                class_id            INTEGER NOT NULL REFERENCES classes(id) ON DELETE CASCADE,
+                label               TEXT NOT NULL,
+                created_at          TEXT NOT NULL,
+                excluded_activities TEXT NOT NULL DEFAULT '[]',
+                repeat_score        INTEGER NOT NULL DEFAULT 0,
+                notes               TEXT NOT NULL DEFAULT '',
+                edited              INTEGER NOT NULL DEFAULT 0
+            )
+        """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS activity_assignments (
+                id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                round_id    INTEGER NOT NULL REFERENCES activity_rounds(id) ON DELETE CASCADE,
+                student_id  INTEGER NOT NULL REFERENCES students(id) ON DELETE CASCADE,
+                activity_id INTEGER NOT NULL REFERENCES activities(id) ON DELETE CASCADE
+            )
+        """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS activity_exclusions (
+                id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                student_id  INTEGER NOT NULL REFERENCES students(id) ON DELETE CASCADE,
+                activity_id INTEGER NOT NULL REFERENCES activities(id) ON DELETE CASCADE,
+                UNIQUE (student_id, activity_id)
+            )
+        """)
+        # ── Phase 4 migrations: Student tag system ─────────────────────────
+        # Idempotent CREATEs so older DBs pick up the new tables cleanly.
+        # No column ALTERs here — tags live entirely in new tables.
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS student_tag_categories (
+                id         INTEGER PRIMARY KEY AUTOINCREMENT,
+                class_id   INTEGER NOT NULL REFERENCES classes(id) ON DELETE CASCADE,
+                name       TEXT NOT NULL,
+                operation  TEXT NOT NULL DEFAULT 'ignore'
+                             CHECK(operation IN ('distribute','cluster',
+                                                  'keep_apart','ignore')),
+                sort_order INTEGER NOT NULL DEFAULT 0,
+                UNIQUE (class_id, name)
+            )
+        """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS student_tag_values (
+                id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                category_id INTEGER NOT NULL REFERENCES student_tag_categories(id) ON DELETE CASCADE,
+                value       TEXT NOT NULL,
+                color       TEXT,
+                sort_order  INTEGER NOT NULL DEFAULT 0,
+                UNIQUE (category_id, value)
+            )
+        """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS student_tags (
+                id         INTEGER PRIMARY KEY AUTOINCREMENT,
+                student_id INTEGER NOT NULL REFERENCES students(id) ON DELETE CASCADE,
+                value_id   INTEGER NOT NULL REFERENCES student_tag_values(id) ON DELETE CASCADE,
+                UNIQUE (student_id, value_id)
+            )
+        """)
 
 
 def _seed_default_seats(conn, table_id: int, capacity: int, w: float, h: float, shape: str):
@@ -758,9 +956,15 @@ def format_student_name(name: str, mode: str = "full",
     that predate the split columns hit this path.
 
     Modes:
-      - 'full'          → 'Alice Smith' / 'Jon Van Der Berg' / 'Hyerin'
-      - 'first_initial' → 'Alice S.'    / 'Jon V.'           / 'Hyerin'
-      - 'first_only'    → 'Alice'       / 'Jon'              / 'Hyerin'
+      - 'full'          → 'Alice Marie Smith' / 'Jon Van Der Berg' / 'Hyerin'
+      - 'first_initial' → 'Alice S.'          / 'Jon V.'           / 'Hyerin'
+      - 'first_only'    → 'Alice'             / 'Jon'              / 'Hyerin'
+
+    Note on middle names: PowerSchool-style imports ("Smith, Alice Marie")
+    store `first="Alice Marie"`. In abbreviated modes (first_only,
+    first_initial) we trim to the FIRST whitespace token of `first` so
+    "Alice Marie" → "Alice". The `full` mode preserves the middle name
+    so teachers can see students' full given names when desired.
     """
     # Resolve first/last. Prefer the explicit args; fall back to parsing
     # the flat `name` field (legacy path).
@@ -768,6 +972,10 @@ def format_student_name(name: str, mode: str = "full",
         first, last = parse_name_input(name or "")
     first = (first or "").strip()
     last  = (last  or "").strip()
+
+    # First-token-only — used by both abbreviated modes to drop middle
+    # names. "Alice Marie" → "Alice", "Mary Jane" → "Mary".
+    first_token = first.split()[0] if first else ""
 
     if mode == "full":
         # Compose the natural order; mononym returns first alone
@@ -777,15 +985,15 @@ def format_student_name(name: str, mode: str = "full",
             return last
         return f"{first} {last}"
     if mode == "first_only":
-        return first if first else last
+        return first_token if first_token else last
     if mode == "first_initial":
         if not last:
             # Mononym — no initial to append
-            return first if first else ""
+            return first_token if first_token else ""
         initial = next((ch for ch in last if ch.isalpha()), "")
         if not initial:
-            return first
-        return f"{first} {initial.upper()}."
+            return first_token
+        return f"{first_token} {initial.upper()}."
     # Unknown mode → be conservative, return the natural form
     if not last:
         return first
@@ -1422,6 +1630,150 @@ def count_new_pairs_in_round(class_id: int, round_id: int) -> int:
     return len(current_pairs - prior_pairs)
 
 
+def count_new_activity_pairs_in_round(class_id: int, round_id: int) -> int:
+    """
+    Activity-rounds equivalent of count_new_pairs_in_round. Returns the
+    number of student pairs in this activity round that had NEVER
+    shared an activity in any prior activity round of this class.
+
+    "Prior" is determined by created_at on activity_rounds — only
+    activity rounds that occurred chronologically before round_id
+    contribute. Seating rounds are NOT considered here; this is the
+    activity-only view. Use count_new_pairs_in_round_combined for the
+    cross-round-type "Showing: All" momentum metric.
+    """
+    with get_connection() as conn:
+        target = conn.execute(
+            "SELECT created_at FROM activity_rounds WHERE id=? AND class_id=?",
+            (round_id, class_id)
+        ).fetchone()
+        if target is None:
+            return 0
+
+        prior_rows = conn.execute("""
+            SELECT aa.round_id, aa.activity_id, aa.student_id
+            FROM activity_assignments aa
+            JOIN activity_rounds      ar ON aa.round_id = ar.id
+            WHERE ar.class_id = ? AND ar.created_at < ?
+        """, (class_id, target["created_at"])).fetchall()
+
+        current_rows = conn.execute("""
+            SELECT activity_id, student_id
+            FROM activity_assignments
+            WHERE round_id = ?
+        """, (round_id,)).fetchall()
+
+    from collections import defaultdict
+    prior_by_group: dict = defaultdict(list)
+    for row in prior_rows:
+        prior_by_group[(row["round_id"], row["activity_id"])].append(row["student_id"])
+    prior_pairs: set = set()
+    for students in prior_by_group.values():
+        for i in range(len(students)):
+            for j in range(i + 1, len(students)):
+                a, b = sorted([students[i], students[j]])
+                prior_pairs.add((a, b))
+
+    current_by_activity: dict = defaultdict(list)
+    for row in current_rows:
+        current_by_activity[row["activity_id"]].append(row["student_id"])
+    current_pairs: set = set()
+    for students in current_by_activity.values():
+        for i in range(len(students)):
+            for j in range(i + 1, len(students)):
+                a, b = sorted([students[i], students[j]])
+                current_pairs.add((a, b))
+
+    return len(current_pairs - prior_pairs)
+
+
+def count_new_pairs_in_round_combined(class_id: int,
+                                         round_id: int,
+                                         round_type: str) -> int:
+    """
+    Combined-mode new-pair counter. Considers BOTH seating and activity
+    rounds when determining "prior" — a pair is "new" in this round
+    only if they hadn't shared a table OR an activity in any earlier
+    round of either type.
+
+    round_type: "seating" or "activity" — tells the function which
+    table the current round lives in so it can fetch the right
+    assignments and timestamp.
+
+    This is the helper backing the "Showing: All" rotation momentum
+    line. For mode-specific momentum, use count_new_pairs_in_round
+    (seating-only) or count_new_activity_pairs_in_round (activity-only).
+    """
+    with get_connection() as conn:
+        # Resolve the current round's timestamp and current pairs
+        if round_type == "seating":
+            target = conn.execute(
+                "SELECT created_at FROM rounds WHERE id=? AND class_id=?",
+                (round_id, class_id)).fetchone()
+            if target is None:
+                return 0
+            cur_ts = target["created_at"]
+            current_rows = conn.execute("""
+                SELECT table_id AS gid, student_id
+                FROM assignments WHERE round_id = ?
+            """, (round_id,)).fetchall()
+        elif round_type == "activity":
+            target = conn.execute(
+                "SELECT created_at FROM activity_rounds WHERE id=? AND class_id=?",
+                (round_id, class_id)).fetchone()
+            if target is None:
+                return 0
+            cur_ts = target["created_at"]
+            current_rows = conn.execute("""
+                SELECT activity_id AS gid, student_id
+                FROM activity_assignments WHERE round_id = ?
+            """, (round_id,)).fetchall()
+        else:
+            return 0
+
+        # Prior assignments from BOTH tables, anything before cur_ts.
+        # Group keys are tagged with their source so we don't
+        # accidentally treat (seating_round=5, table=2) and
+        # (activity_round=5, activity=2) as the same group.
+        prior_seating = conn.execute("""
+            SELECT a.round_id, a.table_id, a.student_id
+            FROM assignments a
+            JOIN rounds      r ON a.round_id = r.id
+            WHERE r.class_id = ? AND r.created_at < ?
+        """, (class_id, cur_ts)).fetchall()
+        prior_activity = conn.execute("""
+            SELECT aa.round_id, aa.activity_id, aa.student_id
+            FROM activity_assignments aa
+            JOIN activity_rounds      ar ON aa.round_id = ar.id
+            WHERE ar.class_id = ? AND ar.created_at < ?
+        """, (class_id, cur_ts)).fetchall()
+
+    from collections import defaultdict
+    prior_by_group: dict = defaultdict(list)
+    for row in prior_seating:
+        prior_by_group[("s", row["round_id"], row["table_id"])].append(row["student_id"])
+    for row in prior_activity:
+        prior_by_group[("a", row["round_id"], row["activity_id"])].append(row["student_id"])
+    prior_pairs: set = set()
+    for students in prior_by_group.values():
+        for i in range(len(students)):
+            for j in range(i + 1, len(students)):
+                a, b = sorted([students[i], students[j]])
+                prior_pairs.add((a, b))
+
+    current_by_group: dict = defaultdict(list)
+    for row in current_rows:
+        current_by_group[row["gid"]].append(row["student_id"])
+    current_pairs: set = set()
+    for students in current_by_group.values():
+        for i in range(len(students)):
+            for j in range(i + 1, len(students)):
+                a, b = sorted([students[i], students[j]])
+                current_pairs.add((a, b))
+
+    return len(current_pairs - prior_pairs)
+
+
 def get_rounds_for_pair(class_id: int, student_a: int, student_b: int) -> list:
     """
     Returns the list of rounds where student_a and student_b shared a table.
@@ -1564,3 +1916,903 @@ def get_student_pairings(class_id: int, student_id: int) -> dict:
     never_paired.sort(key=lambda s: s["name"])
 
     return {"paired": paired, "never_paired": never_paired}
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Phase 3: Activities API
+# ═══════════════════════════════════════════════════════════════════════════
+#
+# Activities are class-level objects (parallel to layouts) that teachers
+# rotate students through weekly. An "activity round" is one week's
+# assignment. Activity rounds accumulate their own history and feed back
+# into pair-history calculations based on the class's pair_history_mode
+# setting.
+#
+# API organization mirrors the existing seating API:
+#   - Activity CRUD: create/get/update/delete/archive
+#   - Activity round CRUD: create/get/delete, plus assignment operations
+#   - Exclusion CRUD: manage student-activity exclusions
+#   - Pair history extensions: get_pair_history_mode_aware() respects
+#     the class's mode setting; get_activity_pair_history() is the new
+#     signal
+#   - Student-activity repeat count: the "don't let Alice tutor every
+#     week" signal, counted from activity_assignments history
+
+# ── Activity CRUD ──────────────────────────────────────────────────────────
+
+def create_activity(class_id: int, name: str, capacity: int,
+                     description: str = "") -> int:
+    """Create an activity under a class. Raises sqlite3.IntegrityError
+    if the name collides with another activity in the same class."""
+    if capacity < 0:
+        raise ValueError(f"Invalid capacity: {capacity}")
+    with get_connection() as conn:
+        # Compute sort_order as one past the current max for this class
+        row = conn.execute(
+            "SELECT COALESCE(MAX(sort_order), -1) + 1 "
+            "FROM activities WHERE class_id=?", (class_id,)).fetchone()
+        next_order = row[0] if row else 0
+        cur = conn.execute(
+            """INSERT INTO activities
+               (class_id, name, capacity, description, sort_order)
+               VALUES (?,?,?,?,?)""",
+            (class_id, name.strip(), capacity, description.strip(), next_order))
+        return cur.lastrowid
+
+
+def get_activity(activity_id: int) -> dict | None:
+    with get_connection() as conn:
+        row = conn.execute(
+            "SELECT * FROM activities WHERE id=?", (activity_id,)).fetchone()
+        return dict(row) if row else None
+
+
+def get_activities_for_class(class_id: int,
+                              include_archived: bool = False) -> list:
+    """Return all activities for a class, ordered by sort_order then
+    name. Archived activities excluded by default."""
+    with get_connection() as conn:
+        if include_archived:
+            rows = conn.execute(
+                "SELECT * FROM activities WHERE class_id=? "
+                "ORDER BY sort_order, name", (class_id,)).fetchall()
+        else:
+            rows = conn.execute(
+                "SELECT * FROM activities WHERE class_id=? AND archived=0 "
+                "ORDER BY sort_order, name", (class_id,)).fetchall()
+        return [dict(r) for r in rows]
+
+
+def update_activity(activity_id: int, name: str, capacity: int,
+                     description: str = ""):
+    """Update activity fields. Raises IntegrityError on name collision."""
+    if capacity < 0:
+        raise ValueError(f"Invalid capacity: {capacity}")
+    with get_connection() as conn:
+        conn.execute(
+            """UPDATE activities
+               SET name=?, capacity=?, description=?
+               WHERE id=?""",
+            (name.strip(), capacity, description.strip(), activity_id))
+
+
+def set_activity_archived(activity_id: int, archived: bool):
+    """Archive (hide from generation) or unarchive an activity.
+    Archived activities retain their history — they're just hidden from
+    the roster of choices when generating new rounds."""
+    with get_connection() as conn:
+        conn.execute("UPDATE activities SET archived=? WHERE id=?",
+                      (1 if archived else 0, activity_id))
+
+
+def delete_activity(activity_id: int):
+    """Permanently delete an activity and cascade its history. The DB's
+    ON DELETE CASCADE on activity_assignments handles cleanup of
+    assignment rows. Exclusions and pins also cascade.
+
+    This is destructive — rounds that referenced this activity will
+    lose their assignment records for it. Teachers should prefer
+    archiving unless they really want to erase the activity from
+    history."""
+    with get_connection() as conn:
+        conn.execute("DELETE FROM activities WHERE id=?", (activity_id,))
+
+
+def activity_has_rounds(activity_id: int) -> bool:
+    """Returns True if any round has assignments referencing this
+    activity. Used for UI to decide whether delete vs archive is the
+    safer option to present."""
+    with get_connection() as conn:
+        row = conn.execute(
+            "SELECT COUNT(*) FROM activity_assignments WHERE activity_id=?",
+            (activity_id,)).fetchone()
+        return row[0] > 0
+
+
+def reorder_activities(class_id: int, ordered_ids: list[int]):
+    """Set sort_order on each listed activity so their order matches the
+    input list. Activities not in the list keep their current order
+    (appended after the reordered set). Used by drag-to-reorder UI."""
+    with get_connection() as conn:
+        for i, aid in enumerate(ordered_ids):
+            conn.execute(
+                "UPDATE activities SET sort_order=? WHERE id=? AND class_id=?",
+                (i, aid, class_id))
+
+
+# ── Activity round CRUD ────────────────────────────────────────────────────
+
+def create_activity_round(class_id: int, label: str, created_at: str,
+                            excluded_activities: list[int] | None = None,
+                            repeat_score: int = 0,
+                            notes: str = "") -> int:
+    """Record a new activity round. excluded_activities is a list of
+    activity IDs that were excluded for this round (e.g. the teacher
+    checked 'skip tutoring this week')."""
+    import json
+    with get_connection() as conn:
+        cur = conn.execute(
+            """INSERT INTO activity_rounds
+               (class_id, label, created_at, excluded_activities,
+                repeat_score, notes)
+               VALUES (?,?,?,?,?,?)""",
+            (class_id, label, created_at,
+             json.dumps(excluded_activities or []),
+             repeat_score, notes))
+        return cur.lastrowid
+
+
+def get_activity_round(round_id: int) -> dict | None:
+    import json
+    with get_connection() as conn:
+        row = conn.execute(
+            "SELECT * FROM activity_rounds WHERE id=?", (round_id,)
+        ).fetchone()
+        if not row:
+            return None
+        d = dict(row)
+        try:
+            d["excluded_activities"] = json.loads(d.get("excluded_activities") or "[]")
+        except (ValueError, TypeError):
+            d["excluded_activities"] = []
+        return d
+
+
+def get_activity_rounds_for_class(class_id: int) -> list:
+    """All activity rounds for a class, newest first."""
+    import json
+    with get_connection() as conn:
+        rows = conn.execute(
+            "SELECT * FROM activity_rounds WHERE class_id=? "
+            "ORDER BY created_at DESC, id DESC",
+            (class_id,)).fetchall()
+    result = []
+    for r in rows:
+        d = dict(r)
+        try:
+            d["excluded_activities"] = json.loads(d.get("excluded_activities") or "[]")
+        except (ValueError, TypeError):
+            d["excluded_activities"] = []
+        result.append(d)
+    return result
+
+
+def delete_activity_round(round_id: int):
+    """Delete a round and its assignments via ON DELETE CASCADE."""
+    with get_connection() as conn:
+        conn.execute("DELETE FROM activity_rounds WHERE id=?", (round_id,))
+
+
+def rename_activity_round(round_id: int, new_label: str):
+    with get_connection() as conn:
+        conn.execute("UPDATE activity_rounds SET label=? WHERE id=?",
+                      (new_label, round_id))
+
+
+def set_activity_round_notes(round_id: int, notes: str):
+    with get_connection() as conn:
+        conn.execute("UPDATE activity_rounds SET notes=? WHERE id=?",
+                      (notes, round_id))
+
+
+def mark_activity_round_edited(round_id: int):
+    """Set edited=1 on a round (indicates teacher modified assignments
+    post-generation)."""
+    with get_connection() as conn:
+        conn.execute("UPDATE activity_rounds SET edited=1 WHERE id=?",
+                      (round_id,))
+
+
+# ── Activity assignment CRUD ───────────────────────────────────────────────
+
+def add_activity_assignment(round_id: int, student_id: int,
+                              activity_id: int) -> int:
+    with get_connection() as conn:
+        cur = conn.execute(
+            """INSERT INTO activity_assignments
+               (round_id, student_id, activity_id)
+               VALUES (?,?,?)""",
+            (round_id, student_id, activity_id))
+        return cur.lastrowid
+
+
+def get_activity_assignments_for_round(round_id: int) -> list:
+    """All (student_id, activity_id) pairs for a round, ordered by
+    activity then student for stable display."""
+    with get_connection() as conn:
+        rows = conn.execute(
+            """SELECT aa.*, s.name AS student_name, a.name AS activity_name
+               FROM activity_assignments aa
+               JOIN students s   ON aa.student_id = s.id
+               JOIN activities a ON aa.activity_id = a.id
+               WHERE aa.round_id = ?
+               ORDER BY a.sort_order, a.name, s.name""",
+            (round_id,)).fetchall()
+        return [dict(r) for r in rows]
+
+
+def clear_activity_assignments_for_round(round_id: int):
+    """Wipe all assignments for a round. Used when regenerating or
+    editing. Callers should add replacement assignments afterward."""
+    with get_connection() as conn:
+        conn.execute("DELETE FROM activity_assignments WHERE round_id=?",
+                      (round_id,))
+
+
+def replace_activity_assignments(round_id: int,
+                                    assignments: list[tuple[int, int]],
+                                    mark_edited: bool = True,
+                                    new_repeat_score: int | None = None):
+    """Fully replace an activity round's assignments. Used by the
+    manual-override editor (mirrors replace_assignments for seating).
+
+    assignments: list of (student_id, activity_id) tuples.
+    mark_edited: set the round's edited flag (teacher modified after
+        generation). Default True.
+    new_repeat_score: optionally update the stored pair-repeat score
+        for this round after the edit.
+    """
+    with get_connection() as conn:
+        conn.execute("DELETE FROM activity_assignments WHERE round_id=?",
+                      (round_id,))
+        conn.executemany(
+            """INSERT INTO activity_assignments (round_id, student_id, activity_id)
+               VALUES (?,?,?)""",
+            [(round_id, sid, aid) for sid, aid in assignments])
+        if mark_edited:
+            conn.execute("UPDATE activity_rounds SET edited=1 WHERE id=?",
+                          (round_id,))
+        if new_repeat_score is not None:
+            conn.execute(
+                "UPDATE activity_rounds SET repeat_score=? WHERE id=?",
+                (new_repeat_score, round_id))
+
+
+# ── Activity exclusions ────────────────────────────────────────────────────
+
+def add_activity_exclusion(student_id: int, activity_id: int):
+    """Mark a student as ineligible for an activity. No-op if the
+    exclusion already exists (UNIQUE constraint; silently ignored)."""
+    with get_connection() as conn:
+        try:
+            conn.execute(
+                """INSERT INTO activity_exclusions
+                   (student_id, activity_id)
+                   VALUES (?,?)""",
+                (student_id, activity_id))
+        except sqlite3.IntegrityError:
+            # Already exists — that's fine, idempotent
+            pass
+
+
+def remove_activity_exclusion(student_id: int, activity_id: int):
+    with get_connection() as conn:
+        conn.execute(
+            """DELETE FROM activity_exclusions
+               WHERE student_id=? AND activity_id=?""",
+            (student_id, activity_id))
+
+
+def get_exclusions_for_student(student_id: int) -> list[int]:
+    """Return list of activity IDs this student is excluded from."""
+    with get_connection() as conn:
+        rows = conn.execute(
+            "SELECT activity_id FROM activity_exclusions WHERE student_id=?",
+            (student_id,)).fetchall()
+        return [r[0] for r in rows]
+
+
+def get_exclusions_for_activity(activity_id: int) -> list[int]:
+    """Return list of student IDs excluded from this activity."""
+    with get_connection() as conn:
+        rows = conn.execute(
+            "SELECT student_id FROM activity_exclusions WHERE activity_id=?",
+            (activity_id,)).fetchall()
+        return [r[0] for r in rows]
+
+
+def get_all_exclusions_for_class(class_id: int) -> list[tuple[int, int]]:
+    """Return (student_id, activity_id) for every exclusion in a class.
+    Used by the optimizer when building its constraint set."""
+    with get_connection() as conn:
+        rows = conn.execute(
+            """SELECT e.student_id, e.activity_id
+               FROM activity_exclusions e
+               JOIN students s   ON e.student_id = s.id
+               JOIN activities a ON e.activity_id = a.id
+               WHERE s.class_id = ? AND a.class_id = ?""",
+            (class_id, class_id)).fetchall()
+        return [(r[0], r[1]) for r in rows]
+
+
+# ── Activity pinning on students ───────────────────────────────────────────
+
+def set_student_activity_pin(student_id: int,
+                               activity_id: int | None):
+    """Pin (or unpin) a student to a specific activity. None clears."""
+    with get_connection() as conn:
+        conn.execute(
+            "UPDATE students SET pinned_activity_id=? WHERE id=?",
+            (activity_id, student_id))
+
+
+# ── Activity pair history ──────────────────────────────────────────────────
+
+def get_activity_pair_history(class_id: int) -> dict:
+    """Returns {(student_a, student_b): count} for student pairs who
+    have shared an activity (in any activity_round for this class).
+    Pair ordering: a < b always, same convention as get_pair_history.
+
+    Parallels the seating-side get_pair_history exactly, just reading
+    from activity_assignments + activity_rounds instead of assignments
+    + rounds."""
+    with get_connection() as conn:
+        rows = conn.execute("""
+            SELECT aa.round_id, aa.activity_id, aa.student_id
+            FROM activity_assignments aa
+            JOIN activity_rounds ar ON aa.round_id = ar.id
+            WHERE ar.class_id = ?
+            ORDER BY aa.round_id, aa.activity_id
+        """, (class_id,)).fetchall()
+
+    from collections import defaultdict
+    group: dict = defaultdict(list)
+    for row in rows:
+        key = (row["round_id"], row["activity_id"])
+        group[key].append(row["student_id"])
+
+    pair_counts: dict = defaultdict(int)
+    for students in group.values():
+        for i in range(len(students)):
+            for j in range(i + 1, len(students)):
+                a, b = sorted([students[i], students[j]])
+                pair_counts[(a, b)] += 1
+    return dict(pair_counts)
+
+
+def get_pair_history_for_mode(class_id: int,
+                                round_type: str) -> dict:
+    """Return pair history respecting the class's pair_history_mode
+    setting. This is what the optimizers should call (rather than the
+    raw get_pair_history / get_activity_pair_history functions).
+
+    round_type: 'seating' or 'activity' — tells us which round is
+        being generated, so we know whether to include the other type's
+        history in combined mode or restrict to just this type's in
+        separate mode.
+
+    Behavior:
+      - mode='combined' (default): returns sum of seating + activity
+        pair counts for BOTH round_types. A pair that sat together
+        3 times and did activities together 2 times returns count=5
+        regardless of which round is being generated.
+      - mode='separate': returns only same-type counts. Generating a
+        seating round sees only seating pairs; generating an activity
+        round sees only activity pairs.
+    """
+    if round_type not in ("seating", "activity"):
+        raise ValueError(f"Invalid round_type: {round_type!r}")
+
+    mode = "combined"
+    with get_connection() as conn:
+        row = conn.execute(
+            "SELECT pair_history_mode FROM classes WHERE id=?",
+            (class_id,)).fetchone()
+        if row and row[0] in ("combined", "separate"):
+            mode = row[0]
+
+    if mode == "separate":
+        if round_type == "seating":
+            return get_pair_history(class_id)
+        return get_activity_pair_history(class_id)
+
+    # Combined: merge both histories
+    seating = get_pair_history(class_id)
+    activity = get_activity_pair_history(class_id)
+    from collections import defaultdict
+    merged: dict = defaultdict(int)
+    for k, v in seating.items():
+        merged[k] += v
+    for k, v in activity.items():
+        merged[k] += v
+    return dict(merged)
+
+
+def get_student_activity_history(class_id: int) -> dict:
+    """Returns {(student_id, activity_id): count} — how many times
+    each student has been assigned to each activity across all
+    activity rounds for this class.
+
+    Used by the activity optimizer as a secondary signal ("don't let
+    Alice tutor every week") and by the Stats panel for display.
+    Parallels get_seat_history in spirit."""
+    with get_connection() as conn:
+        rows = conn.execute("""
+            SELECT aa.student_id, aa.activity_id
+            FROM activity_assignments aa
+            JOIN activity_rounds ar ON aa.round_id = ar.id
+            WHERE ar.class_id = ?
+        """, (class_id,)).fetchall()
+
+    from collections import defaultdict
+    counts: dict = defaultdict(int)
+    for row in rows:
+        counts[(row["student_id"], row["activity_id"])] += 1
+    return dict(counts)
+
+
+# ── Pair history mode helpers ──────────────────────────────────────────────
+
+def get_class_pair_history_mode(class_id: int) -> str:
+    """Returns 'combined' or 'separate'. Defaults to 'combined' if the
+    column is absent (shouldn't happen post-migration, but safe)."""
+    with get_connection() as conn:
+        row = conn.execute(
+            "SELECT pair_history_mode FROM classes WHERE id=?",
+            (class_id,)).fetchone()
+        if row and row[0] in ("combined", "separate"):
+            return row[0]
+    return "combined"
+
+
+def set_class_pair_history_mode(class_id: int, mode: str):
+    if mode not in ("combined", "separate"):
+        raise ValueError(f"Invalid mode: {mode!r}")
+    with get_connection() as conn:
+        conn.execute(
+            "UPDATE classes SET pair_history_mode=? WHERE id=?",
+            (mode, class_id))
+
+
+# ── Helper: does a class use activities at all? ────────────────────────────
+# Used for progressive disclosure — the activity tab empty state, the
+# pin dialog's dynamic sections, etc.
+
+def class_has_activities(class_id: int) -> bool:
+    """True if any activity (active or archived) exists for this class."""
+    with get_connection() as conn:
+        row = conn.execute(
+            "SELECT COUNT(*) FROM activities WHERE class_id=?",
+            (class_id,)).fetchone()
+        return row[0] > 0
+
+
+def class_has_activity_rounds(class_id: int) -> bool:
+    """True if at least one activity round has been generated for this
+    class. Used for pair-history-mode UI disclosure."""
+    with get_connection() as conn:
+        row = conn.execute(
+            "SELECT COUNT(*) FROM activity_rounds WHERE class_id=?",
+            (class_id,)).fetchone()
+        return row[0] > 0
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Phase 4: Student Tag System API
+# ═══════════════════════════════════════════════════════════════════════════
+#
+# Three DB concepts, each with a CRUD surface:
+#   (1) Tag CATEGORIES — "Reading Level", "Grade Level"
+#   (2) Tag VALUES     — "advanced", "on-grade", "support" (under a category)
+#   (3) Student TAGS   — join of student × value
+#
+# Plus helpers that the optimizers call to know which tags apply to
+# which students at generation time, and a disclosure helper for the
+# progressive UI pattern used throughout the app.
+
+# Valid operations — centralized so UI and optimizer stay in sync.
+TAG_OPERATIONS = ("ignore", "distribute", "cluster", "keep_apart")
+
+
+# ── Tag category CRUD ──────────────────────────────────────────────────────
+
+def create_tag_category(class_id: int, name: str,
+                          operation: str = "ignore") -> int:
+    """Create a new tag category under a class. Raises IntegrityError on
+    name collision within the same class."""
+    if operation not in TAG_OPERATIONS:
+        raise ValueError(f"Invalid operation: {operation!r}")
+    with get_connection() as conn:
+        row = conn.execute(
+            "SELECT COALESCE(MAX(sort_order), -1) + 1 "
+            "FROM student_tag_categories WHERE class_id=?",
+            (class_id,)).fetchone()
+        next_order = row[0] if row else 0
+        cur = conn.execute(
+            """INSERT INTO student_tag_categories
+               (class_id, name, operation, sort_order)
+               VALUES (?,?,?,?)""",
+            (class_id, name.strip(), operation, next_order))
+        return cur.lastrowid
+
+
+def get_tag_category(category_id: int) -> dict | None:
+    with get_connection() as conn:
+        row = conn.execute(
+            "SELECT * FROM student_tag_categories WHERE id=?",
+            (category_id,)).fetchone()
+        return dict(row) if row else None
+
+
+def get_tag_categories_for_class(class_id: int) -> list:
+    """Return all tag categories for a class, ordered by sort_order then
+    name. Each dict is the raw row; use get_tag_values_for_category to
+    fetch values separately."""
+    with get_connection() as conn:
+        rows = conn.execute(
+            "SELECT * FROM student_tag_categories WHERE class_id=? "
+            "ORDER BY sort_order, name",
+            (class_id,)).fetchall()
+        return [dict(r) for r in rows]
+
+
+def update_tag_category(category_id: int, name: str, operation: str):
+    """Update a category's name and operation. Value list is managed
+    via get_tag_values_for_category + create_tag_value."""
+    if operation not in TAG_OPERATIONS:
+        raise ValueError(f"Invalid operation: {operation!r}")
+    with get_connection() as conn:
+        conn.execute(
+            """UPDATE student_tag_categories
+               SET name=?, operation=? WHERE id=?""",
+            (name.strip(), operation, category_id))
+
+
+def delete_tag_category(category_id: int):
+    """Delete a category and cascade-delete its values + all student
+    assignments of those values (ON DELETE CASCADE)."""
+    with get_connection() as conn:
+        conn.execute("DELETE FROM student_tag_categories WHERE id=?",
+                      (category_id,))
+
+
+def reorder_tag_categories(class_id: int, ordered_ids: list[int]):
+    """Apply the given order to categories in a class."""
+    with get_connection() as conn:
+        for i, cid in enumerate(ordered_ids):
+            conn.execute(
+                "UPDATE student_tag_categories SET sort_order=? "
+                "WHERE id=? AND class_id=?",
+                (i, cid, class_id))
+
+
+# ── Tag value CRUD ─────────────────────────────────────────────────────────
+
+def create_tag_value(category_id: int, value: str,
+                      color: str | None = None) -> int:
+    """Create a new value under a category. Raises IntegrityError on
+    value collision within the same category."""
+    with get_connection() as conn:
+        row = conn.execute(
+            "SELECT COALESCE(MAX(sort_order), -1) + 1 "
+            "FROM student_tag_values WHERE category_id=?",
+            (category_id,)).fetchone()
+        next_order = row[0] if row else 0
+        cur = conn.execute(
+            """INSERT INTO student_tag_values
+               (category_id, value, color, sort_order)
+               VALUES (?,?,?,?)""",
+            (category_id, value.strip(), color, next_order))
+        return cur.lastrowid
+
+
+def get_tag_value(value_id: int) -> dict | None:
+    with get_connection() as conn:
+        row = conn.execute(
+            "SELECT * FROM student_tag_values WHERE id=?",
+            (value_id,)).fetchone()
+        return dict(row) if row else None
+
+
+def get_tag_values_for_category(category_id: int) -> list:
+    with get_connection() as conn:
+        rows = conn.execute(
+            "SELECT * FROM student_tag_values WHERE category_id=? "
+            "ORDER BY sort_order, value",
+            (category_id,)).fetchall()
+        return [dict(r) for r in rows]
+
+
+def update_tag_value(value_id: int, value: str,
+                      color: str | None = None):
+    with get_connection() as conn:
+        conn.execute(
+            """UPDATE student_tag_values
+               SET value=?, color=? WHERE id=?""",
+            (value.strip(), color, value_id))
+
+
+def delete_tag_value(value_id: int):
+    """Delete a value and cascade-delete all student_tags pointing at it."""
+    with get_connection() as conn:
+        conn.execute("DELETE FROM student_tag_values WHERE id=?",
+                      (value_id,))
+
+
+# ── Student × tag value association ───────────────────────────────────────
+
+def set_student_tag(student_id: int, category_id: int,
+                     value_id: int | None):
+    """Set a student's value for a category. Enforces one-value-per-
+    category at the application level by deleting any existing tags
+    for this student under this category before inserting the new one.
+
+    Passing value_id=None clears the student's value for this category.
+    """
+    with get_connection() as conn:
+        # Remove existing tag(s) for this student × category
+        conn.execute(
+            """DELETE FROM student_tags
+               WHERE student_id = ?
+                 AND value_id IN (
+                    SELECT id FROM student_tag_values
+                    WHERE category_id = ?
+                 )""",
+            (student_id, category_id))
+        if value_id is not None:
+            # Defensive — confirm value_id belongs to the category
+            row = conn.execute(
+                "SELECT category_id FROM student_tag_values WHERE id=?",
+                (value_id,)).fetchone()
+            if not row or row[0] != category_id:
+                raise ValueError(
+                    f"value_id {value_id} does not belong to "
+                    f"category_id {category_id}")
+            try:
+                conn.execute(
+                    """INSERT INTO student_tags (student_id, value_id)
+                       VALUES (?,?)""",
+                    (student_id, value_id))
+            except sqlite3.IntegrityError:
+                # Shouldn't hit (we just cleared the row), but be safe
+                pass
+
+
+def get_tags_for_student(student_id: int) -> list:
+    """Return all tag rows for a student, joined with value and category
+    metadata. Each dict: {value_id, value, color, category_id,
+    category_name, operation}."""
+    with get_connection() as conn:
+        rows = conn.execute("""
+            SELECT
+              st.value_id,
+              tv.value       AS value,
+              tv.color       AS color,
+              tv.category_id AS category_id,
+              tc.name        AS category_name,
+              tc.operation   AS operation,
+              tc.sort_order  AS category_sort,
+              tv.sort_order  AS value_sort
+            FROM student_tags st
+            JOIN student_tag_values     tv ON st.value_id = tv.id
+            JOIN student_tag_categories tc ON tv.category_id = tc.id
+            WHERE st.student_id = ?
+            ORDER BY tc.sort_order, tc.name, tv.sort_order, tv.value
+        """, (student_id,)).fetchall()
+        return [dict(r) for r in rows]
+
+
+def get_all_student_tags_for_class(class_id: int) -> dict:
+    """Return {student_id: [value_id, ...], ...} for every tagged
+    student in the class. The optimizer uses this as a lookup when
+    scoring tag operations — checking "do these two students share
+    a value under a cluster/keep_apart category?"
+
+    Untagged students simply don't appear in the dict."""
+    with get_connection() as conn:
+        rows = conn.execute("""
+            SELECT st.student_id, st.value_id
+            FROM student_tags           st
+            JOIN students               s  ON st.student_id = s.id
+            JOIN student_tag_values     tv ON st.value_id   = tv.id
+            JOIN student_tag_categories tc ON tv.category_id = tc.id
+            WHERE s.class_id = ? AND tc.class_id = ?
+        """, (class_id, class_id)).fetchall()
+    from collections import defaultdict
+    result: dict = defaultdict(list)
+    for r in rows:
+        result[r["student_id"]].append(r["value_id"])
+    return dict(result)
+
+
+def get_tag_operations_for_class(class_id: int) -> list:
+    """Return [{category_id, name, operation, value_ids: [...]}, ...]
+    for every category with a non-ignore operation. This is what the
+    optimizer iterates over to build its soft-constraint cost terms.
+
+    Categories with operation='ignore' are excluded because they
+    contribute no cost; they exist for display/organization only."""
+    with get_connection() as conn:
+        cat_rows = conn.execute("""
+            SELECT id, name, operation
+            FROM student_tag_categories
+            WHERE class_id = ? AND operation != 'ignore'
+            ORDER BY sort_order, name
+        """, (class_id,)).fetchall()
+        result: list = []
+        for c in cat_rows:
+            val_rows = conn.execute(
+                "SELECT id FROM student_tag_values WHERE category_id=?",
+                (c["id"],)).fetchall()
+            result.append({
+                "category_id": c["id"],
+                "name":        c["name"],
+                "operation":   c["operation"],
+                "value_ids":   [v["id"] for v in val_rows],
+            })
+        return result
+
+
+# Soft-constraint weights applied to tag operations in the optimizer.
+# Different operations use different weights:
+#
+#   distribute: +30 — split same-value students across groups. Soft
+#     enough that pair-history rotation (weight 100 in per-seat/activity
+#     mode) still dominates when in conflict.
+#
+#   keep_apart: +60 — STRONGER than distribute, because keep_apart is
+#     a more explicit teacher intent ("never put these students
+#     together"). Still soft (not a hard constraint) so the optimizer
+#     can break it if no feasible alternative exists. Teachers wanting
+#     a hard never-together rule should use Pair Rules instead.
+#
+#   cluster:   -20 — encourage same-value students into the same group.
+#     Weaker so it doesn't fight too hard with pair-history rotation.
+#     A discount of -20 means putting two clusterables together "earns
+#     back" 20 cost units, but a single history meeting (weight 100)
+#     can still override.
+#
+# All three sit below PAIR_REPEAT_WEIGHT (100) so the dominant signal
+# remains pair history.
+TAG_OPERATION_WEIGHT             = 30   # distribute
+TAG_OPERATION_WEIGHT_KEEP_APART  = 60
+TAG_OPERATION_WEIGHT_CLUSTER     = -20
+
+
+def compute_tag_pair_costs(class_id: int) -> list[tuple[int, int, int]]:
+    """Build optimizer-ready tag-pair costs for the class.
+
+    Returns a list of (student_a, student_b, weight_delta) tuples where:
+      - student_a < student_b (canonicalized order)
+      - weight_delta > 0 means "this pair sharing a table/activity costs
+        the optimizer more" (used by `distribute` and `keep_apart`)
+      - weight_delta < 0 means "this pair sharing earns a discount"
+        (used by `cluster`)
+
+    The optimizer treats this exactly like an additional pair-history
+    entry — same y-variable framework, just a different source.
+
+    Pair-emission strategy depends on the operation:
+
+      distribute (weight +30): chain-pair encoding. For N students with
+        the same value, emit only N-1 adjacent pairs (s1,s2), (s2,s3),
+        ... — linear in N rather than quadratic. The semantic is
+        roughly preserved: clustering same-value students triggers
+        multiple chain costs, encouraging splitting.
+
+      cluster (weight -20): also chain-pair encoding for the same
+        performance reason. Negative weight rewards same-group
+        placement of consecutive chain pairs.
+
+      keep_apart (weight +60): FULL pair encoding (all C(N,2) pairs).
+        Justification: keep_apart typically applies to small groups
+        (2-5 "drama-prone" students), so quadratic blow-up is bounded.
+        It's also more critical to catch every pair — chain encoding
+        misses pairs (s1, s3) etc, which for keep_apart means the
+        optimizer could legally put non-adjacent chain members
+        together. Hard cap N≤8 for keep_apart full pairs; beyond that
+        we fall back to chain to protect performance, with a
+        warning in code.
+
+    Categories with operation='ignore' are excluded by
+    get_tag_operations_for_class. Operations not in
+    ('distribute', 'cluster', 'keep_apart') are skipped silently so
+    adding new operations later doesn't crash old call sites.
+    """
+    ops = get_tag_operations_for_class(class_id)
+    if not ops:
+        return []
+
+    # student_id → {value_id, ...}
+    tags_by_sid = get_all_student_tags_for_class(class_id)
+    # For quick "do these two share a value?" lookups by category we
+    # need value_id → category_id. Build it up front.
+    with get_connection() as conn:
+        rows = conn.execute("""
+            SELECT tv.id, tv.category_id
+            FROM student_tag_values     tv
+            JOIN student_tag_categories tc ON tv.category_id = tc.id
+            WHERE tc.class_id = ?
+        """, (class_id,)).fetchall()
+        category_of_value = {r["id"]: r["category_id"] for r in rows}
+
+    # Performance: cap when keep_apart group is large. Past 8 students,
+    # full C(N,2)=28+ pairs starts adding meaningful solver load and
+    # defeats the chain optimization. Most real keep_apart use cases
+    # are small (2-5 students). Beyond the cap we fall back to chain.
+    KEEP_APART_FULL_PAIR_LIMIT = 8
+
+    costs: list[tuple[int, int, int]] = []
+    for op in ops:
+        operation = op["operation"]
+        if operation == "distribute":
+            weight = TAG_OPERATION_WEIGHT          # +30
+            use_chain = True
+        elif operation == "cluster":
+            weight = TAG_OPERATION_WEIGHT_CLUSTER  # -20
+            use_chain = True
+        elif operation == "keep_apart":
+            weight = TAG_OPERATION_WEIGHT_KEEP_APART  # +60
+            # Decide chain vs full per-value below based on size
+            use_chain = False
+        else:
+            # Unknown/future operation — skip silently
+            continue
+
+        # Group students by value within this category
+        students_by_value: dict[int, list[int]] = {
+            vid: [] for vid in op["value_ids"]
+        }
+        for sid, vids in tags_by_sid.items():
+            for vid in vids:
+                if category_of_value.get(vid) == op["category_id"]:
+                    students_by_value.setdefault(vid, []).append(sid)
+
+        for vid, sids in students_by_value.items():
+            if len(sids) < 2:
+                continue
+            sorted_sids = sorted(sids)
+
+            # For keep_apart, use full pairs when small, fall back to
+            # chain for large groups.
+            effective_chain = use_chain
+            if (operation == "keep_apart"
+                    and len(sorted_sids) > KEEP_APART_FULL_PAIR_LIMIT):
+                effective_chain = True
+
+            if effective_chain:
+                # N-1 adjacent pairs
+                for i in range(len(sorted_sids) - 1):
+                    a, b = sorted_sids[i], sorted_sids[i + 1]
+                    a, b = (a, b) if a < b else (b, a)
+                    costs.append((a, b, weight))
+            else:
+                # Full C(N,2) pairs (small keep_apart groups)
+                for i in range(len(sorted_sids)):
+                    for j in range(i + 1, len(sorted_sids)):
+                        a, b = sorted_sids[i], sorted_sids[j]
+                        a, b = (a, b) if a < b else (b, a)
+                        costs.append((a, b, weight))
+    return costs
+
+
+# ── Disclosure helper ─────────────────────────────────────────────────────
+
+def class_has_tags(class_id: int) -> bool:
+    """True if any tag category exists for this class. Used for
+    progressive disclosure — roster Tags column only appears when at
+    least one category is defined."""
+    with get_connection() as conn:
+        row = conn.execute(
+            "SELECT COUNT(*) FROM student_tag_categories WHERE class_id=?",
+            (class_id,)).fetchone()
+        return row[0] > 0

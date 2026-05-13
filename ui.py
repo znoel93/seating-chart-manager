@@ -10,6 +10,7 @@ from tkinter import ttk, messagebox, simpledialog
 from datetime import datetime
 from collections import defaultdict
 import os
+import sqlite3
 
 import db
 import optimizer as opt
@@ -67,6 +68,33 @@ def dim_label(parent, text, bg=None, **kwargs):
     return tk.Label(parent, text=text, font=theme.FONT_SMALL,
                     bg=bg or theme.BG, fg=theme.TEXT_DIM, anchor="w",
                     **kwargs)
+
+
+def _blend_colors(base: str, overlay: str, alpha: float) -> str:
+    """Blend two hex colors at a given alpha, returning a #RRGGBB.
+
+    Used for the Stats heatmap — tints the base panel color toward the
+    accent color to represent magnitude. Base and overlay must be
+    `#RRGGBB` strings. Returns the base color unchanged if either can't
+    be parsed (defensive — ttk themes occasionally use non-hex values).
+    """
+    def _parse(c: str):
+        c = c.lstrip("#")
+        if len(c) != 6:
+            return None
+        try:
+            return (int(c[0:2], 16), int(c[2:4], 16), int(c[4:6], 16))
+        except ValueError:
+            return None
+    b = _parse(base)
+    o = _parse(overlay)
+    if not b or not o:
+        return base
+    alpha = max(0.0, min(1.0, alpha))
+    r = int(b[0] * (1 - alpha) + o[0] * alpha)
+    g = int(b[1] * (1 - alpha) + o[1] * alpha)
+    bl = int(b[2] * (1 - alpha) + o[2] * alpha)
+    return f"#{r:02x}{g:02x}{bl:02x}"
 
 
 def make_text_scroll_container(parent, bg=None, padx=0, pady=0,
@@ -1613,7 +1641,13 @@ class SeatingApp(tk.Tk):
         self.wait_window(dlg)
         if dlg.result:
             try:
-                db.create_class(*dlg.result)
+                # Dialog returns (name, layout_id, seating_mode,
+                # pair_history_mode). pair_history_mode is always None
+                # for new classes — the picker only appears in edit
+                # mode for classes that have activities. New classes
+                # pick up the DB default ('combined') automatically.
+                name, layout_id, mode, _pair_mode = dlg.result
+                db.create_class(name, layout_id, mode)
                 # A new class references a layout, changing that
                 # layout's in-use status (and thus its deletability).
                 self._invalidate_cache("classes", "layouts")
@@ -1629,10 +1663,15 @@ class SeatingApp(tk.Tk):
         self.wait_window(dlg)
         if dlg.result:
             try:
-                # Edit dialog doesn't expose the mode picker — only name
-                # and layout. Unpack just those two.
-                name, layout_id, _mode = dlg.result
+                # Dialog returns a 4-tuple: name, layout_id, seating_mode,
+                # pair_history_mode. Edit flow ignores seating_mode (the
+                # picker isn't shown when editing). pair_history_mode is
+                # None when the picker wasn't shown (class has no
+                # activities); otherwise it's 'combined' or 'separate'.
+                name, layout_id, _mode, pair_mode = dlg.result
                 db.update_class(class_id, name, layout_id)
+                if pair_mode is not None:
+                    db.set_class_pair_history_mode(class_id, pair_mode)
                 # Changing a class's layout changes in-use status on
                 # both the old and new layout.
                 self._invalidate_cache("classes", "layouts")
@@ -1804,8 +1843,11 @@ class SeatingApp(tk.Tk):
         # Header row 2: layout + mode badge + switcher. Separated from
         # row 1 so the right-aligned mode group never gets clipped by
         # long class names or wider fonts (e.g. the monospace themes).
+        # Hidden on the Activity Rounds tab — seating mode is irrelevant
+        # there, and showing it adds noise.
         meta = tk.Frame(self.content, bg=theme.BG, padx=28)
         meta.pack(fill="x", pady=(0, 6))
+        self._class_meta_row = meta
         tk.Label(meta, text=f"[{cls['layout_name'] or 'No layout'}]",
                  font=theme.FONT_BODY, bg=theme.BG,
                  fg=theme.TEXT_DIM).pack(side="left")
@@ -1839,21 +1881,41 @@ class SeatingApp(tk.Tk):
                             fg=theme.ACCENT_TEXT if active else theme.TEXT_DIM)
                 b._btn_bg    = theme.ACCENT if active else theme.BG
                 b._btn_hover = theme.ACCENT_DARK if active else theme.SEP
+            # Show/hide the layout+mode meta row based on active tab.
+            # Activity Rounds doesn't use seating mode, so hide the row
+            # there to reduce noise.
+            try:
+                if self._class_meta_row.winfo_exists():
+                    if key == "activities":
+                        self._class_meta_row.pack_forget()
+                    else:
+                        # Re-pack in its original position (after header
+                        # row 1, before the tab bar)
+                        self._class_meta_row.pack_configure(
+                            fill="x", pady=(0, 6), before=tab_bar)
+            except tk.TclError:
+                pass
             for w in self._tab_content.winfo_children():
                 w.destroy()
-            {"roster":  lambda: self._roster_tab(self._tab_content, class_id),
-             "rounds":  lambda: self._rounds_tab(self._tab_content, class_id, cls),
-             "history": lambda: self._history_tab(self._tab_content, class_id)}[key]()
+            {"roster":     lambda: self._roster_tab(self._tab_content, class_id),
+             "rounds":     lambda: self._rounds_tab(self._tab_content, class_id, cls),
+             "activities": lambda: self._activities_tab(self._tab_content, class_id, cls),
+             "stats":      lambda: self._stats_tab(self._tab_content, class_id, cls)}[key]()
             self._force_paint()
 
         for label, key in [("Roster", "roster"),
-                            ("Seating Chart Rounds", "rounds"),
-                            ("Pair History", "history")]:
+                            ("Seating Rounds", "rounds"),
+                            ("Activity Rounds", "activities"),
+                            ("Stats", "stats")]:
             b = make_btn(tab_bar, f"  {label}  ",
                          command=lambda k=key: switch_tab(k),
                          style="tab", padx=16, pady=8)
             b.pack(side="left")
             self._tab_btns[key] = b
+
+        # Expose switch_tab so other methods (e.g. the Seating Rounds
+        # "View Stats" banner button) can navigate to a different tab.
+        self._class_switch_tab = switch_tab
 
         tk.Frame(self.content, bg=theme.SEP, height=1).pack(fill="x", padx=28)
         # Honour caller-requested initial tab; fall back to roster if an
@@ -1871,6 +1933,9 @@ class SeatingApp(tk.Tk):
         btn_row.pack(side="right")
         make_btn(btn_row, "🚫 Pair Rules",
                  lambda: self._constraints_dialog(class_id, parent),
+                 style="ghost").pack(side="left", padx=(0, 6))
+        make_btn(btn_row, "🏷️ Tags",
+                 lambda: self._tag_rules_dialog(class_id, parent),
                  style="ghost").pack(side="left", padx=(0, 6))
         make_btn(btn_row, "📋 Bulk Import",
                  lambda: self._bulk_import_dialog(class_id, parent),
@@ -1946,6 +2011,9 @@ class SeatingApp(tk.Tk):
         unpin_btn = make_btn(action_btns, "📌 Remove pin",
                               lambda: None, style="ghost", padx=12, pady=5)
         # NOT packed yet — pack is handled by _set_buttons_enabled
+        tags_btn = make_btn(action_btns, "🏷️ Tags",
+                             lambda: None, style="ghost", padx=12, pady=5)
+        tags_btn.pack(side="left", padx=3)
         toggle_btn = make_btn(action_btns, "Deactivate",
                               lambda: None, style="ghost", padx=12, pady=5)
         toggle_btn.pack(side="left", padx=3)
@@ -1959,7 +2027,7 @@ class SeatingApp(tk.Tk):
         # Disabled visual state for the action buttons
         def _set_buttons_enabled(enabled: bool, selected_student: dict = None):
             if not enabled or not selected_student:
-                for b in (pin_btn, toggle_btn, rename_btn, remove_btn):
+                for b in (pin_btn, tags_btn, toggle_btn, rename_btn, remove_btn):
                     b.configure(bg=theme.GHOST_BG, fg=theme.TEXT_MUTED, cursor="")
                     b._btn_bg    = theme.GHOST_BG
                     b._btn_hover = theme.GHOST_BG
@@ -2009,6 +2077,24 @@ class SeatingApp(tk.Tk):
                     unpin_btn.pack_forget()
                 except tk.TclError:
                     pass
+
+            # Tags button — active when the class has any tag categories
+            # defined. If none, the button remains grey/disabled so
+            # teachers who never set up tags don't see noisy clickable
+            # affordances.
+            has_tags = db.class_has_tags(class_id)
+            if has_tags:
+                tags_btn.configure(bg=theme.BG, fg=theme.TEXT, cursor="hand2")
+                tags_btn._btn_bg    = theme.BG
+                tags_btn._btn_hover = theme.SEP
+                tags_btn._command   = (
+                    lambda: self._do_tag_student(sid, class_id, parent))
+            else:
+                tags_btn.configure(bg=theme.GHOST_BG, fg=theme.TEXT_MUTED,
+                                    cursor="")
+                tags_btn._btn_bg    = theme.GHOST_BG
+                tags_btn._btn_hover = theme.GHOST_BG
+                tags_btn._command   = lambda: None
 
             toggle_text = "Deactivate" if is_active else "Activate"
             toggle_btn.configure(text=toggle_text, bg=theme.BG, fg=theme.TEXT,
@@ -2066,14 +2152,71 @@ class SeatingApp(tk.Tk):
         # mode. In per-seat mode we show seat detail when available.
         class_mode = (cls or {}).get("seating_mode", "per_table")
 
+        # Activity lookup for the "Pinned To" column: a student pinned
+        # to an activity displays its name. Exclusions surface as a
+        # count ("2 excl.") appended to the cell. We fetch once up
+        # front to avoid per-row DB queries.
+        activity_name_by_id: dict = {}
+        exclusion_count_by_student: dict = {}
+        has_activities = db.class_has_activities(class_id)
+        if has_activities:
+            for a in db.get_activities_for_class(
+                    class_id, include_archived=True):
+                activity_name_by_id[a["id"]] = a["name"]
+            # One aggregated query rather than one per student
+            try:
+                with db.get_connection() as conn:
+                    rows = conn.execute(
+                        """SELECT e.student_id, COUNT(*) AS n
+                           FROM activity_exclusions e
+                           JOIN students s ON e.student_id = s.id
+                           WHERE s.class_id = ?
+                           GROUP BY e.student_id""",
+                        (class_id,)).fetchall()
+                exclusion_count_by_student = {r["student_id"]: r["n"]
+                                                for r in rows}
+            except Exception:
+                exclusion_count_by_student = {}
+
+        # Tags lookup for the optional "Tags" column. We only show this
+        # column when the class has tags defined; otherwise it's column
+        # noise for teachers who never use the feature.
+        has_tags = db.class_has_tags(class_id)
+        tags_display_by_student: dict = {}
+        if has_tags:
+            # Fetch categories (ordered) and resolve every value_id to
+            # (category_name, value_name) so we can format per-student
+            # summaries without N+1 queries.
+            tag_cats = db.get_tag_categories_for_class(class_id)
+            value_meta_by_id: dict = {}   # value_id -> (cat_sort, cat_name, val_name)
+            for cat in tag_cats:
+                for v in db.get_tag_values_for_category(cat["id"]):
+                    value_meta_by_id[v["id"]] = (cat.get("sort_order", 0),
+                                                   cat["name"], v["value"])
+            # Bulk-fetch student → value_ids
+            tags_by_sid = db.get_all_student_tags_for_class(class_id)
+            for sid, value_ids in tags_by_sid.items():
+                # Sort by category sort order so summaries read in a
+                # stable order even when categories are reordered later.
+                parts_meta = sorted(
+                    (value_meta_by_id[v] for v in value_ids
+                       if v in value_meta_by_id),
+                    key=lambda m: (m[0], m[1]))
+                parts = [f"{cat}: {val}" for (_so, cat, val) in parts_meta]
+                tags_display_by_student[sid] = "  ·  ".join(parts)
+
         cols = ("name", "status", "pinned")
+        if has_tags:
+            cols = cols + ("tags",)
         # Scale tree height to number of students (capped at 20 rows max).
         tree_height = min(20, max(4, len(students)))
         tree = ttk.Treeview(tree_container, columns=cols, show="headings",
                             height=tree_height, selectmode="browse")
-        tree.column("name",   width=280, anchor="w")
-        tree.column("status", width=100, anchor="center")
-        tree.column("pinned", width=140, anchor="center")
+        tree.column("name",   width=260, anchor="w")
+        tree.column("status", width=90,  anchor="center")
+        tree.column("pinned", width=240, anchor="w")
+        if has_tags:
+            tree.column("tags",   width=220, anchor="w")
         tree.tag_configure("inactive", foreground=theme.TEXT_MUTED)
         tree.pack(fill="x")
 
@@ -2097,19 +2240,35 @@ class SeatingApp(tk.Tk):
             if col == "pinned":
                 pin_tid = s.get("pinned_table_id")
                 pin_sid = s.get("pinned_seat_id")
-                if pin_tid is None:
-                    # Unpinned sorts last. Secondary by display so ties are
-                    # still alphabetical.
-                    return (1, "", 0, disp)
-                tbl = table_label_by_id.get(pin_tid, "")
+                pin_aid = s.get("pinned_activity_id")
+                excl_n  = exclusion_count_by_student.get(s.get("id"), 0)
+                any_pin = (pin_tid is not None) or (pin_aid is not None)
+                if not any_pin and not excl_n:
+                    # Nothing in the cell — sorts last
+                    return (1, "", 0, "", 0, disp)
+                # Primary sort: seating pin table name (blank if none).
+                # Secondary: seat number. Tertiary: activity pin name.
+                # Quaternary: exclusion count.
+                tbl = table_label_by_id.get(pin_tid, "") if pin_tid else ""
                 seat_n = seat_number_by_id.get(pin_sid, 0) if pin_sid else 0
-                return (0, tbl.lower(), seat_n, disp)
+                act_name = activity_name_by_id.get(pin_aid, "") if pin_aid else ""
+                return (0, tbl.lower(), seat_n, act_name.lower(), excl_n, disp)
+            if col == "tags":
+                tag_str = tags_display_by_student.get(s.get("id"), "")
+                # Untagged students sort last so the visually populated
+                # rows cluster at the top for quick scanning.
+                return (0 if tag_str else 1, tag_str.lower(), disp)
             return disp
 
         def _update_heading_arrows():
             """Update column headings to show sort direction glyph."""
-            labels = {"name": "Name", "status": "Status", "pinned": "Pinned To"}
+            labels = {"name": "Name", "status": "Status",
+                       "pinned": "Pinned To", "tags": "Tags"}
             for col, default_label in labels.items():
+                # Skip columns that aren't in this roster (tags column
+                # is only present when has_tags is True)
+                if col not in cols:
+                    continue
                 if current_sort and current_sort[0] == col:
                     arrow = "  ↑" if current_sort[1] else "  ↓"
                     tree.heading(col, text=default_label + arrow)
@@ -2135,6 +2294,9 @@ class SeatingApp(tk.Tk):
                      command=lambda: _on_heading_click("status"))
         tree.heading("pinned", text="Pinned To",
                      command=lambda: _on_heading_click("pinned"))
+        if has_tags:
+            tree.heading("tags", text="Tags",
+                         command=lambda: _on_heading_click("tags"))
         _update_heading_arrows()
 
         # Map of tree iid → student dict for O(1) lookup on selection
@@ -2161,23 +2323,42 @@ class SeatingApp(tk.Tk):
                 iid = str(s["id"])
                 pin_tid  = s.get("pinned_table_id")
                 pin_sid  = s.get("pinned_seat_id")
-                if pin_tid is None:
-                    pin_label = "—"
-                else:
+                pin_aid  = s.get("pinned_activity_id")
+
+                # Build the pin label in parts:
+                #   1. Seating (📌 Table / Seat)
+                #   2. Activity (🎯 Name)
+                #   3. Exclusion count (2 excl.)
+                # Join with " · " for tight one-line display.
+                parts = []
+                if pin_tid is not None:
                     tbl_name = table_label_by_id.get(pin_tid, "?")
                     if class_mode == "per_seat" and pin_sid is not None:
                         seat_n = seat_number_by_id.get(pin_sid)
                         if seat_n is not None:
-                            pin_label = f"📌 {tbl_name}, Seat {seat_n}"
+                            parts.append(f"📌 {tbl_name}, Seat {seat_n}")
                         else:
-                            pin_label = f"📌 {tbl_name}"
+                            parts.append(f"📌 {tbl_name}")
                     else:
-                        pin_label = f"📌 {tbl_name}"
+                        parts.append(f"📌 {tbl_name}")
+                if pin_aid is not None:
+                    act_name = activity_name_by_id.get(pin_aid)
+                    if act_name:
+                        parts.append(f"🎯 {act_name}")
+                excl_n = exclusion_count_by_student.get(s["id"], 0)
+                if excl_n:
+                    parts.append(f"{excl_n} excl.")
+                pin_label = "  ·  ".join(parts) if parts else "—"
+
                 display = s.get("display") or s["name"]
+                row_values = [display,
+                              "Active" if s["active"] else "Inactive",
+                              pin_label]
+                if has_tags:
+                    row_values.append(
+                        tags_display_by_student.get(s["id"], ""))
                 tree.insert("", "end", iid=iid,
-                            values=(display,
-                                    "Active" if s["active"] else "Inactive",
-                                    pin_label),
+                            values=tuple(row_values),
                             tags=() if s["active"] else ("inactive",))
                 student_by_iid[iid] = s
                 shown += 1
@@ -2226,6 +2407,23 @@ class SeatingApp(tk.Tk):
                                 last_name=dlg.result["last_name"])
             self._refresh_roster(class_id, tab_parent)
 
+    def _do_tag_student(self, sid: int, class_id: int, tab_parent):
+        """Open the per-student tag assignment dialog. Resolves the
+        student record fresh so we always show the latest display name
+        and any tags already on file (the roster may have stale data
+        if Tag Rules were edited since the roster was last refreshed).
+        """
+        students = db.get_students_for_class(class_id)
+        student = next((s for s in students if s["id"] == sid), None)
+        if not student:
+            return
+        dlg = _StudentTagsDialog(self, student, class_id)
+        self.wait_window(dlg)
+        if dlg.changed:
+            # Refresh the roster — Step 5 will render tag pills there.
+            # Until then this is just defensive consistency.
+            self._refresh_roster(class_id, tab_parent)
+
     def _do_remove_student(self, sid: int, name: str, class_id: int, tab_parent):
         if messagebox.askyesno("Remove Student",
                                f"Remove '{name}'? Their assignment history will also be deleted."):
@@ -2235,19 +2433,83 @@ class SeatingApp(tk.Tk):
     def _do_pin_student(self, sid: int, name: str, current_pin: int | None,
                          class_id: int, tab_parent):
         cls = db.get_class(class_id)
-        if not cls or not cls.get("layout_id"):
-            messagebox.showinfo("No Layout",
-                                "Assign a layout to this class first, then you can pin students.",
-                                parent=self)
+        if not cls:
             return
-        # Fetch the student's full pin state (table + seat) so the dialog
-        # shows accurate current state in per-seat mode.
-        student = next((s for s in db.get_students_for_class(class_id,
-                                                                active_only=False)
-                         if s["id"] == sid), None)
+        has_layout = bool(cls.get("layout_id"))
+        has_activities = db.class_has_activities(class_id)
+
+        if not has_layout and not has_activities:
+            messagebox.showinfo(
+                "Nothing to Pin",
+                "This class has no layout or activities configured. "
+                "Assign a layout in the class editor or create "
+                "activities in the Activity Rounds tab to start "
+                "pinning students.",
+                parent=self)
+            return
+
+        # Route based on what the class has configured:
+        #   layout only       → seating pin dialog
+        #   activities only   → activity pin dialog
+        #   both              → small chooser first
+        if has_layout and not has_activities:
+            self._do_seating_pin(sid, name, class_id, tab_parent, cls)
+            return
+        if has_activities and not has_layout:
+            self._do_activity_pin(sid, name, class_id, tab_parent)
+            return
+        # Both — ask which the teacher wants to modify
+        answer = self._pin_kind_chooser(name)
+        if answer == "seating":
+            self._do_seating_pin(sid, name, class_id, tab_parent, cls)
+        elif answer == "activity":
+            self._do_activity_pin(sid, name, class_id, tab_parent)
+
+    def _pin_kind_chooser(self, student_name: str) -> str | None:
+        """Tiny modal: 'Seating pin' or 'Activity pin / exclusions'.
+        Returns 'seating', 'activity', or None if cancelled."""
+        win = tk.Toplevel(self)
+        win.title(f"Pin {student_name}")
+        win.geometry("420x200")
+        win.configure(bg=theme.BG)
+        win.resizable(False, False)
+        win.grab_set()
+        result = {"choice": None}
+
+        tk.Label(win, text=f"What would you like to set for {student_name}?",
+                 font=theme.FONT_BODY, bg=theme.BG, fg=theme.TEXT,
+                 wraplength=380, justify="left").pack(
+                     anchor="w", padx=24, pady=(18, 14))
+
+        def pick(kind):
+            result["choice"] = kind
+            win.destroy()
+
+        btns = tk.Frame(win, bg=theme.BG, padx=24)
+        btns.pack(fill="x")
+        make_btn(btns, "📌 Seating pin",
+                 lambda: pick("seating"),
+                 style="primary", padx=14, pady=8).pack(
+                     side="left", fill="x", expand=True)
+        make_btn(btns, "🎯 Activity pin / exclusions",
+                 lambda: pick("activity"),
+                 style="primary", padx=14, pady=8).pack(
+                     side="left", fill="x", expand=True, padx=(10, 0))
+
+        make_btn(win, "Cancel", win.destroy,
+                 style="ghost", padx=14, pady=6).pack(pady=(16, 0))
+
+        self.wait_window(win)
+        return result["choice"]
+
+    def _do_seating_pin(self, sid, name, class_id, tab_parent, cls):
+        """Original seating pin flow (extracted from _do_pin_student so
+        the chooser can call it without duplicating logic)."""
+        student = next(
+            (s for s in db.get_students_for_class(class_id, active_only=False)
+             if s["id"] == sid), None)
+        current_pin = student.get("pinned_table_id") if student else None
         current_seat = student.get("pinned_seat_id") if student else None
-        # Use the display form in the dialog title so the user sees the
-        # name in their chosen format ('Alice S.' / 'Alice').
         display_name = (student.get("display") if student else None) or name
         mode = cls.get("seating_mode", "per_table")
         dlg = _PinStudentDialog(self, display_name, cls["layout_id"],
@@ -2257,6 +2519,38 @@ class SeatingApp(tk.Tk):
         if dlg.saved:
             db.set_student_pin_full(sid, dlg.new_pin, dlg.new_seat_pin)
             self._refresh_roster(class_id, tab_parent)
+
+    def _do_activity_pin(self, sid, name, class_id, tab_parent):
+        """Open the activity pin / exclusions dialog, then persist
+        whatever changed."""
+        student = next(
+            (s for s in db.get_students_for_class(class_id, active_only=False)
+             if s["id"] == sid), None)
+        display_name = (student.get("display") if student else None) or name
+        current_pin_id = student.get("pinned_activity_id") if student else None
+        current_exclusions = db.get_exclusions_for_student(sid)
+
+        dlg = _ActivityPinDialog(
+            self, display_name, class_id, sid,
+            current_pin_id=current_pin_id,
+            current_exclusion_ids=current_exclusions)
+        self.wait_window(dlg)
+        if not dlg.saved:
+            return
+
+        # Persist the pin
+        if dlg.new_pin_id != current_pin_id:
+            db.set_student_activity_pin(sid, dlg.new_pin_id)
+
+        # Persist exclusion diffs (add/remove only what changed)
+        old_excl = set(current_exclusions)
+        new_excl = set(dlg.new_exclusions)
+        for aid in new_excl - old_excl:
+            db.add_activity_exclusion(sid, aid)
+        for aid in old_excl - new_excl:
+            db.remove_activity_exclusion(sid, aid)
+
+        self._refresh_roster(class_id, tab_parent)
 
     def _do_remove_pin(self, sid: int, class_id: int, tab_parent):
         """Direct removal of a student's pin — no dialog. Clears both
@@ -2272,6 +2566,15 @@ class SeatingApp(tk.Tk):
         dlg = _ConstraintsDialog(self, class_id)
         self.wait_window(dlg)
         if dlg.changed:
+            self._refresh_roster(class_id, tab_parent)
+
+    def _tag_rules_dialog(self, class_id: int, tab_parent):
+        """Open the Tag Rules manager for a class. Phase 4 entry point.
+        Refreshes the roster on close so any new tag column / pill
+        updates are reflected immediately."""
+        dlg = _TagRulesDialog(self, class_id)
+        self.wait_window(dlg)
+        if getattr(dlg, "changed", False):
             self._refresh_roster(class_id, tab_parent)
 
     def _add_student_dialog(self, class_id, parent):
@@ -2391,13 +2694,13 @@ class SeatingApp(tk.Tk):
                      font=theme.FONT_SMALL, bg=theme.PANEL, fg=theme.TEXT_DIM,
                      anchor="w").pack(anchor="w", pady=(2, 0))
 
-        # Right: full stats button
-        make_btn(inner, "📊 Full Stats",
-                 lambda: self._open_stats_window(class_id, cls),
+        # Right: navigate to Stats tab. Previously this opened a
+        # separate Toplevel window; in v2.0 the stats tab houses all
+        # the content from that window (plus what was already there),
+        # so we just switch tabs.
+        make_btn(inner, "📊 View Stats →",
+                 lambda: self._class_switch_tab("stats"),
                  style="ghost", padx=12, pady=6).pack(side="right")
-
-    def _open_stats_window(self, class_id, cls):
-        _StatsWindow(self, class_id, cls)
 
     def _round_card(self, parent, rnd, class_id, cls, tab_parent):
         card = tk.Frame(parent, bg=theme.PANEL,
@@ -2751,12 +3054,32 @@ class SeatingApp(tk.Tk):
         Responsive reflow grid of fixed-width table cards.
         Accepts {table_id: (display_label, [names])} so tables with the same
         label still render as separate cards.
+
+        Wrapped in a Canvas-based scroll frame so classrooms with many
+        tables (or tall cards full of students) scroll rather than
+        falling off the bottom of the window. Canvas is used instead of
+        the tk.Text-based _scrollable because grid geometry propagates
+        cleanly through Canvas windows but not through Text embedded
+        windows — the latter would break the reflow.
         """
         CARD_W = 220
         GAP    = 12
 
-        container = tk.Frame(parent, bg=theme.BG, padx=16, pady=12)
-        container.pack(fill="both", expand=True, anchor="nw")
+        # ── Scrollable host (Canvas + Scrollbar) ────────────────────────
+        host = tk.Frame(parent, bg=theme.BG)
+        host.pack(fill="both", expand=True)
+        canvas = tk.Canvas(host, bg=theme.BG, bd=0, highlightthickness=0)
+        sb = ttk.Scrollbar(host, orient="vertical", command=canvas.yview)
+        canvas.configure(yscrollcommand=sb.set)
+        # Scrollbar always packed — matches the SIGSEGV-safe pattern used
+        # elsewhere in the app. Dynamically packing it on macOS has been
+        # unstable during Tk geometry passes.
+        sb.pack(side="right", fill="y")
+        canvas.pack(side="left", fill="both", expand=True)
+
+        container = tk.Frame(canvas, bg=theme.BG, padx=16, pady=12)
+        window_id = canvas.create_window((0, 0), window=container,
+                                            anchor="nw")
 
         # Sort by display label for stable, alphabetical layout
         entries = sorted(by_table_display.items(), key=lambda kv: kv[1][0])
@@ -2764,9 +3087,8 @@ class SeatingApp(tk.Tk):
         state = {"cols": 0}
 
         def _build(cols: int):
-            # Safety: this can fire from a late <Configure> event after the
-            # user has switched tabs or closed the round viewer, leaving
-            # `container` destroyed. Bail rather than crash.
+            # Safety: late <Configure> can fire after the tab switched
+            # away and destroyed `container`. Bail rather than crash.
             try:
                 if not container.winfo_exists():
                     return
@@ -2791,34 +3113,115 @@ class SeatingApp(tk.Tk):
                 for name in sorted(names):
                     tk.Label(inner, text=name, font=theme.FONT_BODY,
                              bg=bg_c, fg=theme.TEXT, anchor="w").pack(fill="x")
-                cell.update_idletasks()
-                cell.configure(height=inner.winfo_reqheight())
+                # Read requested height AFTER children pack but BEFORE
+                # scheduling configure, and guard against the window
+                # being destroyed mid-build (happens when a <Configure>
+                # racing against the build tears things down).
+                try:
+                    if inner.winfo_exists() and cell.winfo_exists():
+                        cell.update_idletasks()
+                        cell.configure(height=inner.winfo_reqheight())
+                except tk.TclError:
+                    # Widget went away during update — skip this card
+                    # and keep building. The next <Configure> pass will
+                    # re-lay things out cleanly.
+                    continue
 
-        def _on_resize(e):
+            # Update scrollregion to match the container's new size
+            try:
+                container.update_idletasks()
+                canvas.configure(scrollregion=canvas.bbox("all"))
+            except tk.TclError:
+                pass
+
+        def _on_canvas_resize(e):
+            # Keep the embedded container's width matched to the canvas
+            # so cards can reflow to the full visible width rather than
+            # being capped at their initial request width.
+            try:
+                canvas.itemconfigure(window_id, width=e.width)
+            except tk.TclError:
+                return
             available = e.width - 32
             if available < 1:
                 return
             cols = max(1, (available + GAP) // (CARD_W + GAP))
             _build(cols)
 
-        # Bind on `container` rather than `parent`. When the tab content is
-        # destroyed (user switches to Room View / closes the round viewer),
-        # container's bindings die with it. Binding on `parent` previously
-        # caused the callback to survive and touch zombie widgets, producing
-        # "bad window path name" TclErrors.
-        container.bind("<Configure>", _on_resize)
-        # Force layout and do initial draw synchronously. parent has real
-        # geometry by now because the caller already called win.update() on
-        # the containing window before switching to this tab.
+        canvas.bind("<Configure>", _on_canvas_resize)
+
+        # Trackpad/wheel scrolling — bind to the canvas and forward to
+        # yview_scroll. Normalize delta to ±1 step because macOS
+        # delivers small deltas (1-2) while Windows sends 120 —
+        # passing raw delta to yview_scroll makes macOS feel
+        # hyper-sensitive. Sign-only gives consistent feel.
+        def _on_wheel(e):
+            try:
+                if not canvas.winfo_exists():
+                    return
+                delta = getattr(e, "delta", 0)
+                if delta == 0:
+                    return
+                step = -1 if delta > 0 else 1
+                canvas.yview_scroll(step, "units")
+            except tk.TclError:
+                pass
+            return "break"
+        canvas.bind("<MouseWheel>", _on_wheel)
+        # Also forward wheel events from within the container so
+        # scrolling works when the pointer is over a card, not just
+        # over the canvas background.
+        def _forward_wheel(e):
+            try:
+                if not canvas.winfo_exists():
+                    return
+                delta = getattr(e, "delta", 0)
+                if delta == 0:
+                    return
+                step = -1 if delta > 0 else 1
+                canvas.yview_scroll(step, "units")
+            except tk.TclError:
+                pass
+            return "break"
+        container.bind("<MouseWheel>", _forward_wheel)
+        # Bind recursively to new children so they forward too
+        def _bind_wheel_to_tree(widget):
+            try:
+                widget.bind("<MouseWheel>", _forward_wheel, add="+")
+                for child in widget.winfo_children():
+                    _bind_wheel_to_tree(child)
+            except tk.TclError:
+                pass
+
+        # Force initial layout
         parent.update_idletasks()
-        initial_w = parent.winfo_width()
+        canvas.update_idletasks()
+        initial_w = canvas.winfo_width()
         if initial_w > 1:
+            try:
+                canvas.itemconfigure(window_id, width=initial_w)
+            except tk.TclError:
+                pass
             cols = max(1, (initial_w - 32 + GAP) // (CARD_W + GAP))
             _build(cols)
+            _bind_wheel_to_tree(container)
         else:
-            # Fallback for the rare case parent still has no geometry:
-            # build with a sensible default; <Configure> will refine later.
-            _build(max(1, (800 - 32 + GAP) // (CARD_W + GAP)))
+            # No geometry yet — defer to the first <Configure> event.
+            # Schedule a fallback in case Configure doesn't fire
+            # promptly (rare but happens on some macOS Tk builds).
+            def _deferred():
+                try:
+                    if not canvas.winfo_exists():
+                        return
+                    w = canvas.winfo_width()
+                    if w > 1 and state["cols"] == 0:
+                        canvas.itemconfigure(window_id, width=w)
+                        cols = max(1, (w - 32 + GAP) // (CARD_W + GAP))
+                        _build(cols)
+                        _bind_wheel_to_tree(container)
+                except tk.TclError:
+                    pass
+            canvas.after(50, _deferred)
 
     def _view_round_room(self, parent, cls_fresh: dict, by_seat_id: dict,
                            rnd: dict | None = None,
@@ -2866,67 +3269,554 @@ class SeatingApp(tk.Tk):
         dlg = _ExportDialog(self, rnd, cls_fresh)
         self.wait_window(dlg)
 
-    # ── Pair History tab ──────────────────────────────────────────────────────
+    # ── Stats tab ─────────────────────────────────────────────────────────────
 
-    def _history_tab(self, parent, class_id):
-        top = tk.Frame(parent, bg=theme.BG, pady=14, padx=28)
-        top.pack(fill="x")
-        section_label(top, "Pair History").pack(anchor="w")
-        dim_label(top, "Times each pair of students has shared a table.").pack(anchor="w")
+    def _stats_tab(self, parent, class_id, cls):
+        """Stats tab — delegates entirely to _StatsPanel. The panel
+        owns the mode filter, sub-tab navigation, and all rendering."""
+        panel = _StatsPanel(parent, self, class_id, cls)
+        panel.pack(fill="both", expand=True)
 
-        history    = db.get_pair_history(class_id)
-        id_to_name = {s["id"]: (s.get("display") or s["name"])
-                       for s in db.get_students_for_class(class_id)}
+    def _render_student_activity_heatmap(self, parent, students,
+                                           activities, sa_history,
+                                           id_to_name):
+        """Render the student-activity count grid. Rows = students,
+        columns = activities, cell = count (color-tinted by magnitude).
 
-        if not history:
-            tk.Label(parent, text="No rounds recorded yet.",
-                     font=theme.FONT_BODY, bg=theme.BG, fg=theme.TEXT_DIM).pack(pady=30)
+        Uses a scrollable treeview so large classes don't break the
+        layout. Only students with at least one activity history row
+        are shown by default; the rest would be a wall of zeros.
+        """
+        # Compute max count for color scaling
+        max_count = max(sa_history.values()) if sa_history else 0
+
+        # Filter to students with any history
+        active_sids = {sid for (sid, _), c in sa_history.items() if c > 0}
+        shown_students = [s for s in students if s["id"] in active_sids]
+        if not shown_students:
+            tk.Label(parent,
+                     text="No students have completed activities yet.",
+                     font=theme.FONT_BODY, bg=theme.BG,
+                     fg=theme.TEXT_DIM).pack(pady=10)
             return
 
-        pairs = sorted(
-            [((id_to_name.get(a, f"#{a}"), id_to_name.get(b, f"#{b}")), c)
-             for (a, b), c in history.items()],
-            key=lambda x: -x[1])
+        # Build treeview: one column per activity + the student name
+        col_keys = [f"act_{a['id']}" for a in activities]
+        columns  = ("student",) + tuple(col_keys)
 
-        # ── Search bar ────────────────────────────────────────────────────────
-        search_row = tk.Frame(parent, bg=theme.BG, padx=28)
-        search_row.pack(fill="x", pady=(8, 4))
-        tk.Label(search_row, text="🔍", font=theme.FONT_BODY,
-                 bg=theme.BG, fg=theme.TEXT_DIM).pack(side="left", padx=(0, 6))
-        search_var = tk.StringVar()
-        search_entry = styled_entry(search_row, textvariable=search_var)
-        search_entry.pack(side="left", fill="x", expand=True)
-        count_lbl = tk.Label(search_row, text="", font=theme.FONT_SMALL,
-                             bg=theme.BG, fg=theme.TEXT_MUTED)
-        count_lbl.pack(side="right", padx=(8, 0))
-        dim_label(parent, "    Search matches either student in the pair.",
-                  bg=theme.BG).pack(anchor="w", padx=28)
+        container = tk.Frame(parent, bg=theme.BG,
+                              highlightbackground=theme.BORDER,
+                              highlightthickness=1)
+        container.pack(fill="both", expand=True)
 
-        cols = ("pair", "count")
-        tree = ttk.Treeview(parent, columns=cols, show="headings", height=18)
-        tree.heading("pair",  text="Student Pair")
-        tree.heading("count", text="Times Together")
-        tree.column("pair",  width=420, anchor="w")
-        tree.column("count", width=140, anchor="center")
-        tree.pack(fill="both", expand=True, padx=28, pady=8)
+        style = ttk.Style()
+        style.configure("SAHeatmap.Treeview",
+                         rowheight=26, font=theme.FONT_BODY)
 
-        def _refresh_tree(*_):
-            q = search_var.get().strip().lower()
-            for row in tree.get_children():
-                tree.delete(row)
-            shown = 0
-            for (names, count) in pairs:
-                if q and q not in names[0].lower() and q not in names[1].lower():
-                    continue
-                tree.insert("", "end", values=(f"{names[0]}  &  {names[1]}", count))
-                shown += 1
-            if q:
-                count_lbl.configure(text=f"{shown} of {len(pairs)} matching")
+        tree = ttk.Treeview(container, columns=columns,
+                             show="headings",
+                             style="SAHeatmap.Treeview",
+                             height=min(14, max(4, len(shown_students))))
+        tree.heading("student", text="Student")
+        tree.column("student", width=200, anchor="w")
+        for a, ck in zip(activities, col_keys):
+            tree.heading(ck, text=a["name"])
+            tree.column(ck, width=max(80, min(140, len(a["name"]) * 8)),
+                         anchor="center")
+        tree.pack(fill="both", expand=True)
+
+        # Color tag setup — bucket counts into 4 bins. ttk.Treeview
+        # only supports row-level tags, not per-cell, so the tint
+        # applies to whole rows by the MAXIMUM count in that row.
+        # Good enough for a scannable summary; the exact cell numbers
+        # are still visible.
+        tree.tag_configure("heat_1", background=theme.PANEL)
+        tree.tag_configure("heat_2",
+                             background=_blend_colors(theme.PANEL,
+                                                      theme.ACCENT, 0.15))
+        tree.tag_configure("heat_3",
+                             background=_blend_colors(theme.PANEL,
+                                                      theme.ACCENT, 0.35))
+        tree.tag_configure("heat_4",
+                             background=_blend_colors(theme.PANEL,
+                                                      theme.ACCENT, 0.55))
+
+        for s in shown_students:
+            row_values = [s.get("display") or s["name"]]
+            row_max = 0
+            for a in activities:
+                c = sa_history.get((s["id"], a["id"]), 0)
+                row_values.append(str(c) if c else "·")
+                if c > row_max:
+                    row_max = c
+            # Bucket: 0 = no tag, 1 = heat_1, 2 = heat_2, etc.
+            if max_count <= 0:
+                tag = ""
+            elif row_max >= max_count * 0.75:
+                tag = "heat_4"
+            elif row_max >= max_count * 0.5:
+                tag = "heat_3"
+            elif row_max >= max_count * 0.25:
+                tag = "heat_2"
             else:
-                count_lbl.configure(text=f"{len(pairs)} pairs")
+                tag = "heat_1"
+            tree.insert("", "end", values=tuple(row_values),
+                          tags=(tag,) if tag else ())
 
-        search_var.trace_add("write", _refresh_tree)
-        _refresh_tree()
+    # ── Activity Rounds tab ───────────────────────────────────────────────────
+
+    def _activities_tab(self, parent, class_id, cls):
+        """Top-level renderer for the Activity Rounds tab. Shows either
+        a full-bleed empty state (when the class has no activities yet)
+        or the two-sub-tab view (Activities | Rounds)."""
+        activities = db.get_activities_for_class(class_id, include_archived=True)
+        if not activities:
+            self._render_activities_empty_state(parent, class_id, cls)
+            return
+
+        # Sub-tab strip
+        sub_tab_state = getattr(self, "_active_activity_subtab", "activities")
+        if sub_tab_state not in ("activities", "rounds"):
+            sub_tab_state = "activities"
+
+        sub_bar = tk.Frame(parent, bg=theme.BG, padx=28)
+        sub_bar.pack(fill="x", pady=(14, 0))
+        sub_btns: dict = {}
+        sub_content = tk.Frame(parent, bg=theme.BG)
+        sub_content.pack(fill="both", expand=True)
+
+        def switch_sub(key):
+            self._active_activity_subtab = key
+            for k, b in sub_btns.items():
+                active = (k == key)
+                b.configure(bg=theme.ACCENT if active else theme.BG,
+                            fg=theme.ACCENT_TEXT if active else theme.TEXT_DIM)
+                b._btn_bg    = theme.ACCENT if active else theme.BG
+                b._btn_hover = theme.ACCENT_DARK if active else theme.SEP
+            for w in sub_content.winfo_children():
+                w.destroy()
+            if key == "activities":
+                self._render_activities_subtab(sub_content, class_id, cls)
+            else:
+                self._render_activity_rounds_subtab(sub_content, class_id, cls)
+
+        for label, key in [("Activities", "activities"),
+                            ("Rounds", "rounds")]:
+            b = make_btn(sub_bar, f"  {label}  ",
+                         command=lambda k=key: switch_sub(k),
+                         style="tab", padx=14, pady=6)
+            b.pack(side="left")
+            sub_btns[key] = b
+
+        tk.Frame(parent, bg=theme.SEP, height=1).pack(fill="x", padx=28)
+        switch_sub(sub_tab_state)
+
+    def _render_activities_empty_state(self, parent, class_id, cls):
+        """Full-bleed explainer + CTA shown when the class has zero
+        activities defined. Once a teacher creates their first activity,
+        the normal sub-tab view takes over."""
+        outer = tk.Frame(parent, bg=theme.BG)
+        outer.pack(fill="both", expand=True)
+
+        card = tk.Frame(outer, bg=theme.PANEL,
+                         highlightbackground=theme.BORDER,
+                         highlightthickness=1)
+        card.place(relx=0.5, rely=0.4, anchor="center")
+        inner = tk.Frame(card, bg=theme.PANEL, padx=40, pady=32)
+        inner.pack()
+
+        tk.Label(inner, text="🎯  Activity Rounds",
+                 font=theme.FONT_HEAD, bg=theme.PANEL,
+                 fg=theme.TEXT).pack(pady=(0, 10))
+        tk.Label(inner,
+                 text="Group students into activities rather than seats.\n"
+                      "Use for things like tutoring rotations, helper\n"
+                      "assignments, or any task-based student grouping.",
+                 font=theme.FONT_BODY, bg=theme.PANEL,
+                 fg=theme.TEXT_DIM, justify="center").pack(pady=(0, 18))
+        make_btn(inner, "+ Create Your First Activity",
+                 lambda: self._create_activity_dialog(class_id, cls),
+                 style="primary", padx=22, pady=10).pack()
+
+    def _render_activities_subtab(self, parent, class_id, cls):
+        """List of defined activities with CRUD controls."""
+        top = tk.Frame(parent, bg=theme.BG, pady=14, padx=28)
+        top.pack(fill="x")
+        section_label(top, "Activities").pack(side="left")
+        make_btn(top, "+ New Activity",
+                 lambda: self._create_activity_dialog(class_id, cls),
+                 style="primary").pack(side="right")
+
+        dim_label(parent,
+                  "Define the activities students rotate through. "
+                  "Each activity has a capacity (how many students "
+                  "can participate at once).",
+                  bg=theme.BG).pack(anchor="w", padx=28, pady=(0, 10))
+
+        activities = db.get_activities_for_class(class_id, include_archived=True)
+        active   = [a for a in activities if not a.get("archived")]
+        archived = [a for a in activities if a.get("archived")]
+
+        if not active and not archived:
+            # Shouldn't hit this path — parent routes to empty state
+            # when there are zero activities — but guard just in case.
+            tk.Label(parent, text="No activities defined yet.",
+                     font=theme.FONT_BODY, bg=theme.BG,
+                     fg=theme.TEXT_DIM).pack(pady=30)
+            return
+
+        sf = self._scrollable(parent)
+        list_frame = tk.Frame(sf, bg=theme.BG, padx=28, pady=6)
+        list_frame.pack(fill="both", expand=True)
+
+        for a in active:
+            self._render_activity_card(list_frame, class_id, cls, a,
+                                        is_archived=False)
+
+        if archived:
+            tk.Frame(list_frame, bg=theme.SEP, height=1).pack(
+                fill="x", pady=(16, 8))
+            tk.Label(list_frame,
+                     text=f"Archived ({len(archived)})",
+                     font=theme.FONT_SMALL, bg=theme.BG,
+                     fg=theme.TEXT_MUTED, anchor="w").pack(
+                         anchor="w", pady=(0, 6))
+            for a in archived:
+                self._render_activity_card(list_frame, class_id, cls, a,
+                                            is_archived=True)
+
+    def _render_activity_card(self, parent, class_id, cls, activity,
+                                is_archived: bool):
+        """One activity in the list: name, capacity, description, and
+        edit/archive/delete buttons."""
+        card = tk.Frame(parent, bg=theme.PANEL,
+                         highlightbackground=theme.BORDER,
+                         highlightthickness=1)
+        card.pack(fill="x", pady=(0, 6))
+        inner = tk.Frame(card, bg=theme.PANEL, padx=14, pady=10)
+        inner.pack(fill="x")
+
+        # Left: name + capacity + description
+        left = tk.Frame(inner, bg=theme.PANEL)
+        left.pack(side="left", fill="x", expand=True)
+
+        title_row = tk.Frame(left, bg=theme.PANEL)
+        title_row.pack(anchor="w", fill="x")
+        tk.Label(title_row, text=activity["name"],
+                 font=theme.FONT_BOLD, bg=theme.PANEL,
+                 fg=theme.TEXT_DIM if is_archived else theme.TEXT,
+                 anchor="w").pack(side="left")
+        cap_text = f"  ·  {activity['capacity']} student{'s' if activity['capacity'] != 1 else ''} max"
+        tk.Label(title_row, text=cap_text,
+                 font=theme.FONT_SMALL, bg=theme.PANEL,
+                 fg=theme.TEXT_MUTED).pack(side="left")
+        if is_archived:
+            tk.Label(title_row, text="  ·  archived",
+                     font=theme.FONT_SMALL, bg=theme.PANEL,
+                     fg=theme.TEXT_MUTED).pack(side="left")
+
+        if activity.get("description"):
+            tk.Label(left, text=activity["description"],
+                     font=theme.FONT_SMALL, bg=theme.PANEL,
+                     fg=theme.TEXT_DIM, anchor="w",
+                     wraplength=500, justify="left").pack(
+                         anchor="w", pady=(2, 0))
+
+        # Right: actions
+        right = tk.Frame(inner, bg=theme.PANEL)
+        right.pack(side="right")
+
+        if is_archived:
+            make_btn(right, "Unarchive",
+                     lambda a=activity: self._archive_activity(
+                         class_id, cls, a["id"], archived=False),
+                     style="ghost", padx=12, pady=6).pack(side="left", padx=(0, 6))
+        else:
+            make_btn(right, "Edit",
+                     lambda a=activity: self._edit_activity_dialog(
+                         class_id, cls, a),
+                     style="ghost", padx=12, pady=6).pack(side="left", padx=(0, 6))
+            make_btn(right, "Archive",
+                     lambda a=activity: self._archive_activity(
+                         class_id, cls, a["id"], archived=True),
+                     style="ghost", padx=12, pady=6).pack(side="left", padx=(0, 6))
+
+        # Delete is only offered when the activity has no history —
+        # otherwise the teacher should archive to preserve past rounds.
+        has_rounds = db.activity_has_rounds(activity["id"])
+        if not has_rounds:
+            make_btn(right, "Delete",
+                     lambda a=activity: self._delete_activity(
+                         class_id, cls, a["id"], a["name"]),
+                     style="danger", padx=12, pady=6).pack(side="left")
+
+    def _render_activity_rounds_subtab(self, parent, class_id, cls):
+        """History of activity rounds for this class. Round generation
+        handler is stubbed — full flow comes in Step 5."""
+        top = tk.Frame(parent, bg=theme.BG, pady=14, padx=28)
+        top.pack(fill="x")
+        section_label(top, "Activity Rounds").pack(side="left")
+        make_btn(top, "+ Generate Activity Round",
+                 lambda: self._generate_activity_round(class_id, cls),
+                 style="primary").pack(side="right")
+
+        active_activities = db.get_activities_for_class(
+            class_id, include_archived=False)
+        rounds = db.get_activity_rounds_for_class(class_id)
+
+        if not rounds:
+            msg = (f"No activity rounds yet. You have "
+                    f"{len(active_activities)} active "
+                    f"{'activity' if len(active_activities) == 1 else 'activities'} "
+                    "defined. Click Generate Activity Round above to create "
+                    "your first weekly assignment.")
+            tk.Label(parent, text=msg,
+                     font=theme.FONT_BODY, bg=theme.BG,
+                     fg=theme.TEXT_DIM, wraplength=600,
+                     justify="center").pack(pady=30, padx=40)
+            return
+
+        # Round list — each card is clickable (opens result view) and
+        # has a delete button. We don't allow in-place rename here;
+        # that stays a future nicety.
+        sf = self._scrollable(parent)
+        list_frame = tk.Frame(sf, bg=theme.BG, padx=28, pady=6)
+        list_frame.pack(fill="both", expand=True)
+        for r in rounds:
+            card = tk.Frame(list_frame, bg=theme.PANEL,
+                             highlightbackground=theme.BORDER,
+                             highlightthickness=1)
+            card.pack(fill="x", pady=(0, 6))
+            inner = tk.Frame(card, bg=theme.PANEL, padx=14, pady=10)
+            inner.pack(fill="x")
+
+            # Left: label + meta
+            left = tk.Frame(inner, bg=theme.PANEL)
+            left.pack(side="left", fill="x", expand=True)
+            tk.Label(left, text=r["label"],
+                     font=theme.FONT_BOLD, bg=theme.PANEL,
+                     fg=theme.TEXT, anchor="w").pack(anchor="w")
+            # Format created_at a little cleaner — trim to date+minute
+            ts = (r.get("created_at") or "").replace("T", " ")[:16]
+            pair_repeats = r.get("repeat_score", 0)
+            meta_parts = [ts] if ts else []
+            meta_parts.append(f"pair repeats: {pair_repeats}")
+            if r.get("edited"):
+                meta_parts.append("edited")
+            meta = "  ·  ".join(meta_parts)
+            tk.Label(left, text=meta,
+                     font=theme.FONT_SMALL, bg=theme.PANEL,
+                     fg=theme.TEXT_DIM, anchor="w").pack(
+                         anchor="w", pady=(2, 0))
+
+            # Right: view + export + delete buttons
+            right = tk.Frame(inner, bg=theme.PANEL)
+            right.pack(side="right")
+            make_btn(right, "View",
+                     lambda rnd=r: self._view_activity_round(
+                         rnd, class_id, cls),
+                     style="ghost", padx=12, pady=6).pack(
+                         side="left", padx=(0, 6))
+            make_btn(right, "⬇ Export PDF",
+                     lambda rnd=r: self._do_export_activity_round_pdf(
+                         rnd, class_id, cls),
+                     style="primary", padx=12, pady=6).pack(
+                         side="left", padx=(0, 6))
+            make_btn(right, "Delete",
+                     lambda rnd=r: self._delete_activity_round(
+                         rnd, class_id, cls),
+                     style="danger", padx=12, pady=6).pack(side="left")
+
+    # ── Activity CRUD dialogs ─────────────────────────────────────────────
+
+    def _create_activity_dialog(self, class_id, cls):
+        """Open a dialog to create a new activity. On success, refresh
+        the tab so the new activity shows up."""
+        dlg = _ActivityDialog(self, class_id, title="New Activity")
+        self.wait_window(dlg)
+        if dlg.result:
+            try:
+                db.create_activity(
+                    class_id,
+                    name=dlg.result["name"],
+                    capacity=dlg.result["capacity"],
+                    description=dlg.result.get("description", ""))
+            except sqlite3.IntegrityError:
+                messagebox.showerror(
+                    "Duplicate Name",
+                    f"An activity named '{dlg.result['name']}' already "
+                    "exists in this class. Please choose a different name.",
+                    parent=self)
+                return
+            except Exception as e:
+                messagebox.showerror("Error", str(e), parent=self)
+                return
+            self._refresh_activities_tab(class_id, cls)
+
+    def _edit_activity_dialog(self, class_id, cls, activity):
+        dlg = _ActivityDialog(self, class_id,
+                                title="Edit Activity",
+                                existing=activity)
+        self.wait_window(dlg)
+        if dlg.result:
+            try:
+                db.update_activity(
+                    activity["id"],
+                    name=dlg.result["name"],
+                    capacity=dlg.result["capacity"],
+                    description=dlg.result.get("description", ""))
+            except sqlite3.IntegrityError:
+                messagebox.showerror(
+                    "Duplicate Name",
+                    f"An activity named '{dlg.result['name']}' already "
+                    "exists in this class.", parent=self)
+                return
+            except Exception as e:
+                messagebox.showerror("Error", str(e), parent=self)
+                return
+            self._refresh_activities_tab(class_id, cls)
+
+    def _archive_activity(self, class_id, cls, activity_id, archived: bool):
+        db.set_activity_archived(activity_id, archived)
+        self._refresh_activities_tab(class_id, cls)
+
+    def _delete_activity(self, class_id, cls, activity_id, name):
+        if not messagebox.askyesno(
+                "Delete Activity",
+                f"Delete activity '{name}'? This cannot be undone.\n\n"
+                "(If this activity has been used in past rounds, consider "
+                "archiving instead.)",
+                parent=self):
+            return
+        try:
+            db.delete_activity(activity_id)
+        except Exception as e:
+            messagebox.showerror("Error", str(e), parent=self)
+            return
+        self._refresh_activities_tab(class_id, cls)
+
+    def _refresh_activities_tab(self, class_id, cls):
+        """Re-render the Activity Rounds tab in place, preserving the
+        selected sub-tab so CRUD operations don't snap back to the
+        Activities sub-tab when the teacher was on Rounds."""
+        for w in self._tab_content.winfo_children():
+            w.destroy()
+        self._activities_tab(self._tab_content, class_id, cls)
+        self._force_paint()
+
+    def _generate_activity_round(self, class_id, cls):
+        """Open the activity round generation dialog. Fetches active
+        students and active (non-archived) activities, instantiates
+        the dialog, waits for it, and refreshes the tab if the round
+        was saved."""
+        students = db.get_students_for_class(class_id, active_only=True)
+        activities = db.get_activities_for_class(
+            class_id, include_archived=False)
+        if not activities:
+            messagebox.showwarning(
+                "No Activities",
+                "Define at least one activity before generating a round.",
+                parent=self)
+            return
+        if not students:
+            messagebox.showwarning(
+                "No Students",
+                "Add students to this class before generating a round.",
+                parent=self)
+            return
+        dlg = _GenerateActivityRoundDialog(
+            self, students, activities, class_id, cls)
+        self.wait_window(dlg)
+        # The dialog itself opens the result view on success; we refresh
+        # on close regardless so the rounds list stays in sync whether
+        # the user saved, cancelled, or regenerated.
+        if getattr(dlg, "committed", False):
+            self._refresh_activities_tab(class_id, cls)
+
+    def _export_activity_pdf(self, round_id: int, label: str,
+                               pair_score: int,
+                               activity_repeat_score: int,
+                               cls: dict, parent=None):
+        """Shared activity-round PDF export. Called from two places:
+          - The round result dialog (via its Export PDF button)
+          - The round list card's Export PDF button
+        `parent` is the window to parent the dialog and any error
+        messagebox to. If None, the SeatingApp itself is used.
+
+        Opens the activity export dialog, which prompts for label,
+        orientation, and include-score before invoking the save-file
+        picker. This mirrors the seating-PDF flow so teachers get the
+        same options for both round types."""
+        _ActivityExportDialog(
+            parent or self,
+            round_id=round_id,
+            label=label,
+            pair_score=pair_score,
+            activity_repeat_score=activity_repeat_score,
+            cls=cls)
+
+    def _view_activity_round(self, rnd, class_id, cls):
+        """Open the result dialog for an existing saved round. Reuses
+        the same result-view class that the generation flow opens."""
+        _ActivityRoundResultDialog(
+            self, rnd["id"], rnd["label"],
+            rnd.get("repeat_score", 0),
+            # activity_repeat_score isn't stored — recompute from history
+            self._compute_activity_repeat_score_for_round(rnd["id"], class_id),
+            class_id, cls)
+
+    def _do_export_activity_round_pdf(self, rnd, class_id, cls):
+        """Card-level PDF export handler. Computes the activity-repeat
+        score (not persisted, same as in _view_activity_round) and
+        delegates to the shared exporter."""
+        ar_score = self._compute_activity_repeat_score_for_round(
+            rnd["id"], class_id)
+        self._export_activity_pdf(
+            round_id=rnd["id"],
+            label=rnd["label"],
+            pair_score=rnd.get("repeat_score", 0),
+            activity_repeat_score=ar_score,
+            cls=cls)
+
+    def _compute_activity_repeat_score_for_round(self, round_id, class_id):
+        """Re-derive activity-repeat score for a saved round by counting
+        assignments that match prior (student, activity) history from
+        OTHER rounds. We don't persist this score on activity_rounds
+        (it's not a human-meaningful metric in isolation), but the
+        result view expects it.
+
+        Logic: for each (student, activity) pair in this round, count
+        how many EARLIER rounds this class has that also had this pair.
+        Sum those counts."""
+        assignments = db.get_activity_assignments_for_round(round_id)
+        score = 0
+        with db.get_connection() as conn:
+            for a in assignments:
+                row = conn.execute(
+                    """SELECT COUNT(*) FROM activity_assignments aa
+                       JOIN activity_rounds ar ON aa.round_id = ar.id
+                       WHERE ar.class_id = ?
+                         AND aa.student_id = ?
+                         AND aa.activity_id = ?
+                         AND aa.round_id < ?""",
+                    (class_id, a["student_id"], a["activity_id"],
+                     round_id)).fetchone()
+                score += row[0]
+        return score
+
+    def _delete_activity_round(self, rnd, class_id, cls):
+        """Delete an activity round. Cascades assignments."""
+        if not messagebox.askyesno(
+                "Delete Round",
+                f"Delete activity round '{rnd['label']}'?\n\n"
+                "This will remove all assignments for this round and "
+                "cannot be undone. Past rounds contribute to pair "
+                "history, so deleting them changes future optimizer "
+                "behaviour.",
+                parent=self):
+            return
+        db.delete_activity_round(rnd["id"])
+        self._refresh_activities_tab(class_id, cls)
 
     # ── Layouts ───────────────────────────────────────────────────────────────
 
@@ -4629,6 +5519,12 @@ class _GenerateRoundDialog(tk.Toplevel):
         forbidden = [(c["student_a"], c["student_b"])
                      for c in db.get_pair_constraints(self.class_id)]
 
+        # Tag operations (distribute/cluster/keep_apart) feed in as soft
+        # pair costs. Returns [] when the class has no non-ignore tag
+        # categories, so this is zero overhead for classes that don't
+        # use the tag system.
+        tag_pair_costs = db.compute_tag_pair_costs(self.class_id)
+
         # Dispatch to the right optimizer based on the class's seating mode.
         # The result shape is the same in both cases (a list of (student_id,
         # seat_id, table_id) tuples) — per-table mode leaves seat_id=None.
@@ -4638,6 +5534,7 @@ class _GenerateRoundDialog(tk.Toplevel):
                 opt_students, opt_seats, pair_history,
                 forbidden_pairs=forbidden,
                 seat_history=seat_history,
+                tag_pair_costs=tag_pair_costs,
                 time_limit_seconds=self._timeout_seconds)
         else:
             # Per-table mode: build a simpler Student/Table list and call
@@ -4650,6 +5547,7 @@ class _GenerateRoundDialog(tk.Toplevel):
             result = opt_table.optimise_seating(
                 tbl_students, tbl_tables, pair_history,
                 forbidden_pairs=forbidden,
+                tag_pair_costs=tag_pair_costs,
                 time_limit_seconds=self._timeout_seconds)
 
         if "Infeasible" in result.status:
@@ -4791,6 +5689,694 @@ class _GenerateRoundDialog(tk.Toplevel):
         switch("list")
 
 
+# ── Activity Round Generation Dialog ──────────────────────────────────────────
+
+class _GenerateActivityRoundDialog(tk.Toplevel):
+    """Dialog for generating an activity round. Mirrors the shape of
+    _GenerateRoundDialog (seating) but simpler — no seating mode
+    dispatch, no seat adjacency, no layout. Student-activity history
+    is a second signal the optimizer uses (discouraging repeats) on
+    top of pair history.
+
+    Flow:
+      1. Teacher sets label, marks absent students, excludes activities
+      2. _run validates, pulls history, calls activity_optimizer
+      3. On success, persists round + assignments and opens the
+         result window via _show_result.
+
+    The `committed` attribute stays False until save succeeds, so the
+    parent knows whether to refresh its list.
+    """
+
+    def __init__(self, parent, students, activities, class_id, cls):
+        super().__init__(parent)
+        self.students   = students
+        self.activities = activities
+        self.class_id   = class_id
+        self.cls        = cls
+        self.committed  = False
+        self.title("Generate Activity Round")
+        self.geometry("560x540")
+        self.configure(bg=theme.BG)
+        self.resizable(True, True)
+
+        # Track absent/excluded state. These start empty.
+        self.absent_ids:  set = set()
+        self.excluded_activity_ids: set = set()
+
+        self._build()
+
+    def _build(self):
+        tk.Label(self, text="Generate Activity Round",
+                 font=theme.FONT_TITLE,
+                 bg=theme.BG, fg=theme.TEXT, padx=24, pady=16).pack(anchor="w")
+        tk.Frame(self, bg=theme.SEP, height=1).pack(fill="x", padx=24)
+
+        # Bottom-fixed controls (pinned; always visible regardless of
+        # content height or scroll state)
+        bottom = tk.Frame(self, bg=theme.BG, padx=24, pady=12)
+        bottom.pack(side="bottom", fill="x")
+
+        self.status_lbl = tk.Label(bottom, text="", font=theme.FONT_BODY,
+                                    bg=theme.BG, fg=theme.TEXT_DIM)
+        self.status_lbl.pack(side="bottom", anchor="w", pady=(10, 0), fill="x")
+
+        btn_row = tk.Frame(bottom, bg=theme.BG)
+        btn_row.pack(side="bottom", fill="x")
+        make_btn(btn_row, "Generate & Save", self._run,
+                 style="primary", padx=18, pady=9).pack(side="left")
+        make_btn(btn_row, "Cancel", self.destroy,
+                 style="ghost", padx=18, pady=9).pack(side="left", padx=10)
+
+        # Scrollable body
+        body_container, body_text = make_text_scroll_container(
+            self, padx=24, pady=12)
+        body_container.pack(fill="both", expand=True)
+
+        def add_block(widget, pady_after: int = 0):
+            body_text.window_create("end", window=widget, stretch=1)
+            body_text.insert("end", "\n")
+            if pady_after:
+                spacer = tk.Frame(body_text, bg=theme.BG, height=pady_after)
+                body_text.window_create("end", window=spacer)
+                body_text.insert("end", "\n")
+
+        # ── Round label ──────────────────────────────────────────────────────
+        lbl = tk.Label(body_text, text="Round label", font=theme.FONT_BOLD,
+                        bg=theme.BG, fg=theme.TEXT, anchor="w")
+        add_block(lbl)
+        self.label_var = tk.StringVar(
+            value=f"Week of {datetime.now().strftime('%b %d, %Y')}")
+        entry_frame = tk.Frame(body_text, bg=theme.BG)
+        styled_entry(entry_frame, textvariable=self.label_var).pack(
+            fill="x", anchor="w")
+        add_block(entry_frame, pady_after=14)
+
+        # ── Pin / exclusion info line ────────────────────────────────────────
+        # Surfaces what's going on to the teacher so they're not confused
+        # about why certain students always end up at certain activities.
+        pinned_count = sum(
+            1 for s in self.students if s.get("pinned_activity_id"))
+        excl_count = 0
+        for s in self.students:
+            # Only count exclusions that land on active-for-this-round
+            # activities. If all a student's excluded activities are
+            # already excluded from this round, the student's exclusions
+            # effectively don't apply.
+            active_aid_set = {a["id"] for a in self.activities}
+            student_ex = set(db.get_exclusions_for_student(s["id"]))
+            if student_ex & active_aid_set:
+                excl_count += 1
+        info_parts = []
+        if pinned_count:
+            info_parts.append(
+                f"{pinned_count} student{'s' if pinned_count != 1 else ''} "
+                f"pinned to specific activities")
+        if excl_count:
+            info_parts.append(
+                f"{excl_count} student{'s' if excl_count != 1 else ''} "
+                f"with activity exclusions")
+        if info_parts:
+            info_lbl = tk.Label(body_text,
+                                 text="ℹ  " + "  ·  ".join(info_parts),
+                                 font=theme.FONT_SMALL, bg=theme.BG,
+                                 fg=theme.TEXT_DIM, anchor="w",
+                                 wraplength=480, justify="left")
+            add_block(info_lbl, pady_after=12)
+
+        # ── Absent students ──────────────────────────────────────────────────
+        lbl2 = tk.Label(body_text, text="Absent students",
+                         font=theme.FONT_BOLD,
+                         bg=theme.BG, fg=theme.TEXT, anchor="w")
+        add_block(lbl2)
+        hint1 = tk.Label(body_text,
+                          text="Click a student to mark them absent this round.",
+                          font=theme.FONT_SMALL, bg=theme.BG,
+                          fg=theme.TEXT_DIM, anchor="w")
+        add_block(hint1, pady_after=6)
+
+        style = ttk.Style()
+        style.configure("ActGen.Treeview", rowheight=28,
+                        font=theme.FONT_BODY)
+
+        absent_container = tk.Frame(body_text, bg=theme.BG,
+                                      highlightbackground=theme.BORDER,
+                                      highlightthickness=1)
+        absent_tree = ttk.Treeview(absent_container,
+                                     columns=("check", "name"),
+                                     show="tree",
+                                     style="ActGen.Treeview",
+                                     # Show all rows within container;
+                                     # outer Text widget handles scroll.
+                                     height=max(1, len(self.students)))
+        absent_tree.column("#0", width=30, stretch=False, anchor="center")
+        absent_tree.pack(fill="x")
+        add_block(absent_container, pady_after=14)
+
+        def toggle_absent(event):
+            row = absent_tree.identify_row(event.y)
+            if not row:
+                return
+            sid = int(row)
+            if sid in self.absent_ids:
+                self.absent_ids.discard(sid)
+                absent_tree.item(row, text="☐")
+            else:
+                self.absent_ids.add(sid)
+                absent_tree.item(row, text="☑")
+
+        for s in self.students:
+            label_text = s.get("display") or s["name"]
+            absent_tree.insert("", "end", iid=str(s["id"]),
+                                 text="☐", values=("", label_text))
+        absent_tree.bind("<Button-1>", toggle_absent)
+
+        # ── Excluded activities ──────────────────────────────────────────────
+        lbl3 = tk.Label(body_text, text="Excluded activities",
+                         font=theme.FONT_BOLD,
+                         bg=theme.BG, fg=theme.TEXT, anchor="w")
+        add_block(lbl3)
+        hint2 = tk.Label(body_text,
+                          text="Skip these activities for this round. Useful "
+                               "when an activity isn't running this week.",
+                          font=theme.FONT_SMALL, bg=theme.BG,
+                          fg=theme.TEXT_DIM, anchor="w",
+                          wraplength=480, justify="left")
+        add_block(hint2, pady_after=6)
+
+        exclude_container = tk.Frame(body_text, bg=theme.BG,
+                                       highlightbackground=theme.BORDER,
+                                       highlightthickness=1)
+        exclude_tree = ttk.Treeview(exclude_container,
+                                      columns=("check", "name"),
+                                      show="tree",
+                                      style="ActGen.Treeview",
+                                      height=max(1, len(self.activities)))
+        exclude_tree.column("#0", width=30, stretch=False, anchor="center")
+        exclude_tree.pack(fill="x")
+        add_block(exclude_container, pady_after=14)
+
+        def toggle_exclude(event):
+            row = exclude_tree.identify_row(event.y)
+            if not row:
+                return
+            aid = int(row)
+            if aid in self.excluded_activity_ids:
+                self.excluded_activity_ids.discard(aid)
+                exclude_tree.item(row, text="☐")
+            else:
+                self.excluded_activity_ids.add(aid)
+                exclude_tree.item(row, text="☑")
+
+        for a in self.activities:
+            lbl_text = f"{a['name']}  ({a['capacity']} max)"
+            exclude_tree.insert("", "end", iid=str(a["id"]),
+                                  text="☐", values=("", lbl_text))
+        exclude_tree.bind("<Button-1>", toggle_exclude)
+
+    def _run(self):
+        """Validate, run optimizer, persist round, and open result view."""
+        label = self.label_var.get().strip()
+        if not label:
+            messagebox.showwarning("Missing Label",
+                                    "Please enter a round label.",
+                                    parent=self)
+            return
+
+        # Resolve timeout from user settings (same mechanism as seating)
+        timeout_preset = db.get_setting("default_optimizer_timeout", "Standard")
+        timeout_map = {"Fast": 10, "Standard": 30,
+                        "Thorough": 120, "Ridiculous": 600}
+        timeout_seconds = timeout_map.get(timeout_preset, 30)
+
+        present = [s for s in self.students
+                    if s["id"] not in self.absent_ids]
+        active_activities = [a for a in self.activities
+                               if a["id"] not in self.excluded_activity_ids]
+
+        if not present:
+            messagebox.showwarning("No Students",
+                                    "All students are marked absent.",
+                                    parent=self)
+            return
+        if not active_activities:
+            messagebox.showwarning("No Activities",
+                                    "All activities are excluded.",
+                                    parent=self)
+            return
+        total_capacity = sum(a["capacity"] for a in active_activities)
+        if total_capacity < len(present):
+            messagebox.showwarning(
+                "Not Enough Activity Slots",
+                f"{len(present)} students need assignments but only "
+                f"{total_capacity} slots are available across the active "
+                "activities. Either exclude fewer activities, mark more "
+                "students absent, or increase activity capacities.",
+                parent=self)
+            return
+
+        self.status_lbl.configure(
+            text=f"⏳  Running optimiser (up to {timeout_seconds}s)…",
+            fg=theme.ACCENT)
+        self.update()
+
+        # Pair history respects class's pair_history_mode setting. For an
+        # activity round: combined = seating+activity pairs, separate =
+        # activity pairs only.
+        pair_history = db.get_pair_history_for_mode(
+            self.class_id, round_type="activity")
+        sa_history = db.get_student_activity_history(self.class_id)
+
+        # Build optimizer inputs. Pin/exclusion lookup happens per-student.
+        # If a student's pinned activity is excluded this round, drop
+        # the pin for this round — it would force infeasibility otherwise.
+        import activity_optimizer as ao
+        active_aid_set = {a["id"] for a in active_activities}
+        opt_students = []
+        for s in present:
+            pin_aid = s.get("pinned_activity_id")
+            if pin_aid is not None and pin_aid not in active_aid_set:
+                pin_aid = None
+            # Exclusions: include only those referencing active activities
+            all_ex = db.get_exclusions_for_student(s["id"])
+            active_ex = [aid for aid in all_ex if aid in active_aid_set]
+            opt_students.append(ao.Student(
+                id=s["id"], name=s["name"],
+                pinned_activity_id=pin_aid,
+                excluded_activity_ids=active_ex))
+        opt_activities = [ao.Activity(id=a["id"], capacity=a["capacity"])
+                            for a in active_activities]
+
+        forbidden = [(c["student_a"], c["student_b"])
+                     for c in db.get_pair_constraints(self.class_id)]
+
+        # Tag operations apply uniformly across seating and activity
+        # rounds (the same compute helper is used by both call sites).
+        # Returns [] for classes without any non-ignore tag categories.
+        tag_pair_costs = db.compute_tag_pair_costs(self.class_id)
+
+        result = ao.optimise_activity_assignment(
+            students=opt_students,
+            activities=opt_activities,
+            pair_history=pair_history,
+            student_activity_history=sa_history,
+            forbidden_pairs=forbidden,
+            tag_pair_costs=tag_pair_costs,
+            time_limit_seconds=timeout_seconds)
+
+        if "Infeasible" in result.status:
+            self.status_lbl.configure(
+                text=f"✗  {result.status}", fg=theme.DANGER)
+            return
+
+        # Persist the round
+        round_id = db.create_activity_round(
+            self.class_id, label, datetime.now().isoformat(),
+            excluded_activities=list(self.excluded_activity_ids),
+            repeat_score=result.total_repeat_score,
+            notes="")
+        for (student_id, activity_id) in result.assignments:
+            db.add_activity_assignment(round_id, student_id, activity_id)
+
+        status_parts = [f"✓  {result.status}",
+                        f"pair repeats: {result.total_repeat_score}",
+                        f"activity repeats: {result.total_activity_repeat_score}"]
+        self.status_lbl.configure(
+            text="  ·  ".join(status_parts),
+            fg=theme.SUCCESS)
+        self.committed = True
+
+        # Open result view after a short pause so the teacher sees the
+        # success status before the window transitions
+        self.after(500, lambda: self._show_result(
+            round_id, label,
+            result.total_repeat_score,
+            result.total_activity_repeat_score))
+
+    def _show_result(self, round_id, label, pair_score, activity_repeat_score):
+        """Open the result view. Grabs the app reference BEFORE
+        destroying self — creating a Toplevel with no parent produces
+        an orphan on macOS whose geometry is broken."""
+        app = self.master
+        self.destroy()
+        _ActivityRoundResultDialog(
+            app, round_id, label, pair_score, activity_repeat_score,
+            self.class_id, self.cls)
+
+
+class _ActivityRoundResultDialog(tk.Toplevel):
+    """Column-card view of an activity round result. Each activity gets
+    a vertical card listing the students assigned to it. Inspired by
+    the teacher's manual sticky-note tool.
+
+    Offers Regenerate (re-open the generate dialog with same inputs,
+    same student roster) and Close. Manual editing is not in scope
+    for v1 — teachers can use pins or exclusions to influence the
+    optimizer, or regenerate for a different result."""
+
+    def __init__(self, parent, round_id, label, pair_score,
+                  activity_repeat_score, class_id, cls):
+        super().__init__(parent)
+        self.round_id = round_id
+        self.label    = label
+        self.pair_score = pair_score
+        self.activity_repeat_score = activity_repeat_score
+        self.class_id = class_id
+        self.cls      = cls
+        self.title(f"Result: {label}")
+        self.geometry("900x620")
+        self.configure(bg=theme.BG)
+        self._build()
+
+    def _build(self):
+        # Header
+        hdr = tk.Frame(self, bg=theme.BG, padx=24, pady=16)
+        hdr.pack(fill="x")
+        tk.Label(hdr, text=self.label, font=theme.FONT_TITLE,
+                 bg=theme.BG, fg=theme.TEXT).pack(anchor="w")
+
+        # Status line — headline + detail
+        if self.pair_score == 0:
+            sc = theme.SUCCESS
+            sm = "✓  No repeated pairings!"
+        elif self.pair_score <= 6:
+            sc = theme.ACCENT
+            sm = f"{self.pair_score} repeated pairing{'s' if self.pair_score != 1 else ''}"
+        else:
+            sc = theme.DANGER
+            sm = f"{self.pair_score} repeated pairing{'s' if self.pair_score != 1 else ''}"
+        tk.Label(hdr, text=sm, font=theme.FONT_BOLD,
+                 bg=theme.BG, fg=sc).pack(anchor="w")
+
+        # Secondary line: activity-repeat score
+        if self.activity_repeat_score == 0:
+            ar_text = "No students doing a repeat activity."
+        else:
+            ar_text = (f"{self.activity_repeat_score} student "
+                       f"{'is' if self.activity_repeat_score == 1 else 'are'} "
+                       "doing a repeat activity.")
+        tk.Label(hdr, text=ar_text,
+                 font=theme.FONT_SMALL, bg=theme.BG,
+                 fg=theme.TEXT_DIM).pack(anchor="w")
+
+        tk.Frame(self, bg=theme.SEP, height=1).pack(fill="x", padx=24)
+
+        # Footer with Export + Close buttons
+        footer = tk.Frame(self, bg=theme.BG, padx=24, pady=14)
+        footer.pack(side="bottom", fill="x")
+
+        # Help note — explains how to influence future rounds
+        hint = tk.Label(footer,
+                         text="Don't love this result? Set student pins or "
+                              "exclusions, or regenerate to get a different "
+                              "assignment.",
+                         font=theme.FONT_SMALL, bg=theme.BG,
+                         fg=theme.TEXT_MUTED, wraplength=540,
+                         justify="left", anchor="w")
+        hint.pack(side="left", fill="x", expand=True)
+
+        make_btn(footer, "Close", self._close,
+                 style="ghost", padx=18, pady=9).pack(side="right")
+        make_btn(footer, "↓ Export PDF", self._export_pdf,
+                 style="primary", padx=18, pady=9).pack(
+                     side="right", padx=(0, 10))
+        make_btn(footer, "✎ Edit Assignments", self._edit_assignments,
+                 style="ghost", padx=18, pady=9).pack(
+                     side="right", padx=(0, 10))
+
+        # Body: scrollable strip of activity column cards. Horizontal
+        # scroll when there are more activities than fit across the
+        # window; vertical scroll when a card has more students than
+        # fit in the window height. Both scrollbars always packed
+        # (macOS SIGSEGV-safe pattern).
+        body = tk.Frame(self, bg=theme.BG)
+        body.pack(fill="both", expand=True, padx=24, pady=(8, 0))
+
+        canvas = tk.Canvas(body, bg=theme.BG, bd=0, highlightthickness=0)
+        h_scroll = ttk.Scrollbar(body, orient="horizontal",
+                                  command=canvas.xview)
+        v_scroll = ttk.Scrollbar(body, orient="vertical",
+                                  command=canvas.yview)
+        canvas.configure(xscrollcommand=h_scroll.set,
+                          yscrollcommand=v_scroll.set)
+        # Pack order matters: bottom scrollbar first (pinned to bottom),
+        # right scrollbar next (pinned to right), then canvas fills.
+        h_scroll.pack(side="bottom", fill="x")
+        v_scroll.pack(side="right", fill="y")
+        canvas.pack(side="left", fill="both", expand=True)
+
+        inner = tk.Frame(canvas, bg=theme.BG)
+        canvas.create_window((0, 0), window=inner, anchor="nw")
+
+        def _on_configure(_event=None):
+            try:
+                canvas.configure(scrollregion=canvas.bbox("all"))
+            except tk.TclError:
+                pass
+        inner.bind("<Configure>", _on_configure)
+
+        # Trackpad / wheel scrolling. On macOS, vertical wheel events
+        # arrive as <MouseWheel>; horizontal swipes arrive as
+        # <Shift-MouseWheel>. Bind both on the canvas AND recursively
+        # forward from the inner frame + cards so the wheel works
+        # regardless of where the pointer is hovering.
+        #
+        # Normalize delta to a fixed ±1 step — macOS delivers small
+        # deltas (1-2) per tick while Windows sends 120. Passing raw
+        # delta to yview_scroll makes macOS feel hyper-sensitive.
+        # Sign-only gives consistent feel across platforms.
+        def _on_v_wheel(e):
+            try:
+                if not canvas.winfo_exists():
+                    return
+                delta = getattr(e, "delta", 0)
+                if delta == 0:
+                    return
+                step = -1 if delta > 0 else 1
+                canvas.yview_scroll(step, "units")
+            except tk.TclError:
+                pass
+            return "break"
+        def _on_h_wheel(e):
+            try:
+                if not canvas.winfo_exists():
+                    return
+                delta = getattr(e, "delta", 0)
+                if delta == 0:
+                    return
+                step = -1 if delta > 0 else 1
+                canvas.xview_scroll(step, "units")
+            except tk.TclError:
+                pass
+            return "break"
+        def _forward_v_wheel(e):
+            try:
+                if not canvas.winfo_exists():
+                    return
+                delta = getattr(e, "delta", 0)
+                if delta == 0:
+                    return
+                step = -1 if delta > 0 else 1
+                canvas.yview_scroll(step, "units")
+            except tk.TclError:
+                pass
+            return "break"
+        def _forward_h_wheel(e):
+            try:
+                if not canvas.winfo_exists():
+                    return
+                delta = getattr(e, "delta", 0)
+                if delta == 0:
+                    return
+                step = -1 if delta > 0 else 1
+                canvas.xview_scroll(step, "units")
+            except tk.TclError:
+                pass
+            return "break"
+        canvas.bind("<MouseWheel>",       _on_v_wheel)
+        canvas.bind("<Shift-MouseWheel>", _on_h_wheel)
+        inner.bind("<MouseWheel>",        _forward_v_wheel)
+        inner.bind("<Shift-MouseWheel>",  _forward_h_wheel)
+        def _bind_wheel_to_tree(widget):
+            try:
+                widget.bind("<MouseWheel>",       _forward_v_wheel, add="+")
+                widget.bind("<Shift-MouseWheel>", _forward_h_wheel, add="+")
+                for child in widget.winfo_children():
+                    _bind_wheel_to_tree(child)
+            except tk.TclError:
+                pass
+
+        # Fetch assignments and group by activity
+        assignments = db.get_activity_assignments_for_round(self.round_id)
+        activities  = db.get_activities_for_class(
+            self.class_id, include_archived=True)
+        activity_by_id = {a["id"]: a for a in activities}
+        students_by_id = {s["id"]: s for s in
+                           db.get_students_for_class(self.class_id,
+                                                      active_only=False)}
+
+        # Group assignments by activity_id
+        by_activity: dict = defaultdict(list)
+        for a in assignments:
+            by_activity[a["activity_id"]].append(a)
+
+        # Only render activities that had assignments in this round
+        # (excluded activities had none). Preserve sort_order.
+        activity_ids_with_assignments = [
+            a["id"] for a in activities
+            if a["id"] in by_activity
+        ]
+
+        for aid in activity_ids_with_assignments:
+            act = activity_by_id[aid]
+            students_here = by_activity[aid]
+
+            # Card width is driven by the wraplength of the labels
+            # inside, NOT by width=N + pack_propagate(False). That
+            # combination nukes the card's height because Tk can't
+            # infer it without propagation. Let the inner content
+            # dictate geometry.
+            card = tk.Frame(inner, bg=theme.PANEL,
+                             highlightbackground=theme.BORDER,
+                             highlightthickness=1)
+            card.pack(side="left", padx=6, pady=6, fill="y", anchor="n")
+
+            # Column header. The wider `wraplength` gives long activity
+            # names room to wrap cleanly to a second or third line
+            # instead of being truncated. `width=22` sets a stable
+            # character-width floor so short-named cards don't render
+            # skinnier than wrapped long-named ones (without it, the
+            # card column widths would be uneven).
+            header = tk.Frame(card, bg=theme.ACCENT, pady=10, padx=10)
+            header.pack(fill="x")
+            tk.Label(header, text=act["name"],
+                     font=theme.FONT_BOLD, bg=theme.ACCENT,
+                     fg=theme.ACCENT_TEXT, wraplength=200,
+                     justify="center", width=22).pack(fill="x")
+            tk.Label(header,
+                     text=f"{len(students_here)}/{act['capacity']}",
+                     font=theme.FONT_SMALL, bg=theme.ACCENT,
+                     fg=theme.ACCENT_TEXT).pack(pady=(2, 0))
+
+            # Description sub-header (if any). Lives between the
+            # accent band and the student list, visually grouped with
+            # the card header. Italic + dim so it reads as metadata,
+            # not as a student name.
+            desc = (act.get("description") or "").strip()
+            if desc:
+                desc_frame = tk.Frame(card, bg=theme.PANEL,
+                                        padx=10, pady=6)
+                desc_frame.pack(fill="x")
+                tk.Label(desc_frame, text=desc,
+                         font=theme.FONT_SMALL, bg=theme.PANEL,
+                         fg=theme.TEXT_DIM, wraplength=190,
+                         justify="left", anchor="w").pack(
+                             fill="x", anchor="w")
+                # Thin separator before the student list for visual
+                # structure (mirrors the seating round result cards).
+                tk.Frame(card, bg=theme.BORDER, height=1).pack(fill="x")
+
+            # Student list
+            list_frame = tk.Frame(card, bg=theme.PANEL, padx=10, pady=10)
+            list_frame.pack(fill="both", expand=True)
+            if not students_here:
+                # Shouldn't happen (activities with no assignments are
+                # filtered out above), but guard for safety.
+                tk.Label(list_frame, text="(empty)",
+                         font=theme.FONT_SMALL, bg=theme.PANEL,
+                         fg=theme.TEXT_DIM).pack(pady=4)
+            for assignment in students_here:
+                stu = students_by_id.get(assignment["student_id"], {})
+                display = stu.get("display") or stu.get("name") or "?"
+                lbl = tk.Label(list_frame, text=display,
+                                font=theme.FONT_BODY, bg=theme.PANEL,
+                                fg=theme.TEXT, wraplength=190,
+                                justify="left", anchor="w")
+                lbl.pack(fill="x", anchor="w", pady=2)
+
+        # After all cards are built, propagate wheel bindings into
+        # every child so trackpad scroll works regardless of which
+        # card the pointer is hovering over. Recurse once at the end
+        # rather than per-card to keep the build loop simple.
+        _bind_wheel_to_tree(inner)
+
+        # Force scrollregion to update now that all cards are laid out.
+        # The <Configure> binding on `inner` is supposed to handle this
+        # automatically, but on macOS the event timing for widgets
+        # embedded in a Canvas window is unreliable — explicitly
+        # computing bbox here ensures scrollbars reflect the real
+        # content size on first render.
+        try:
+            inner.update_idletasks()
+            canvas.configure(scrollregion=canvas.bbox("all"))
+        except tk.TclError:
+            pass
+
+    def _export_pdf(self):
+        """Delegate to the shared app-level PDF export method so the
+        same flow works from here AND from the round list's export
+        button."""
+        app = self.master
+        try:
+            app._export_activity_pdf(
+                round_id=self.round_id,
+                label=self.label,
+                pair_score=self.pair_score,
+                activity_repeat_score=self.activity_repeat_score,
+                cls=self.cls,
+                parent=self)
+        except AttributeError:
+            # Defensive — shouldn't hit unless master isn't SeatingApp
+            messagebox.showerror(
+                "Export Error",
+                "PDF export is unavailable from this context.",
+                parent=self)
+
+    def _edit_assignments(self):
+        """Open the manual edit dialog. On save, close + reopen this
+        dialog so the new arrangement is shown (similar pattern to the
+        seating-side flow: edit, refresh, reflect)."""
+        # Refetch the round so we have current state (in case the user
+        # has edited before in this session). Defensive — usually the
+        # in-memory data is fresh enough.
+        rnd = db.get_activity_round(self.round_id)
+        if not rnd:
+            messagebox.showerror(
+                "Round Not Found",
+                "Could not load this round for editing.",
+                parent=self)
+            return
+        dlg = _ActivityAssignmentEditorDialog(self, rnd, self.cls)
+        self.wait_window(dlg)
+        if dlg.saved:
+            # Update our cached score so any downstream displays
+            # reflect the edit, then close and reopen so the cards
+            # show the new arrangement.
+            self.pair_score = dlg.new_repeat_score
+            app = self.master
+            self.destroy()
+            try:
+                # Re-open the result dialog with refreshed data
+                app._view_activity_round(rnd, self.class_id, self.cls)
+            except Exception:
+                pass
+
+    def _close(self):
+        """Close and trigger parent refresh so the new round shows up."""
+        app = self.master
+        self.destroy()
+        # Find the class detail view and refresh it. The simplest path:
+        # ask app to re-open the class on the activities tab.
+        try:
+            app._active_class_tab = "activities"
+            app._active_activity_subtab = "rounds"
+            app._open_class(self.class_id, initial_tab="activities")
+        except Exception:
+            # If something goes wrong with the refresh, the window is
+            # still closed which is what the user asked for.
+            pass
+
+
 # ── Export Dialog ─────────────────────────────────────────────────────────────
 
 class _ExportDialog(tk.Toplevel):
@@ -4911,6 +6497,154 @@ class _ExportDialog(tk.Toplevel):
                 text=f"✓ Saved to {os.path.basename(out_path)}", fg=theme.SUCCESS)
             # Honour user preference for auto-open. Default on preserves the
             # original behaviour for existing users.
+            if db.get_setting("open_pdf_after_export", "1") == "1":
+                import subprocess, sys
+                if sys.platform == "darwin":
+                    subprocess.run(["open", out_path])
+                elif sys.platform == "win32":
+                    os.startfile(out_path)
+                else:
+                    subprocess.run(["xdg-open", out_path])
+            self.after(1500, self.destroy)
+        except Exception as e:
+            self.status_lbl.configure(text=f"✗ Error: {e}", fg=theme.DANGER)
+
+
+class _ActivityExportDialog(tk.Toplevel):
+    """Activity-round PDF export dialog. Mirrors _ExportDialog (the
+    seating-PDF dialog) so teachers get a consistent flow for both
+    round types: choose a label, pick orientation, optionally include
+    scores, then pick where to save.
+
+    Different from _ExportDialog only in that the underlying exporter
+    is export_activity_pdf and there's no per_table/per_seat mode —
+    activity rounds are list-only by nature."""
+    def __init__(self, parent, round_id: int, label: str,
+                   pair_score: int, activity_repeat_score: int,
+                   cls: dict):
+        super().__init__(parent)
+        self.round_id = round_id
+        self.initial_label = label
+        self.pair_score = pair_score
+        self.activity_repeat_score = activity_repeat_score
+        self.cls = cls
+        self.title("Export Activity Round PDF")
+        self.geometry("460x340")
+        self.configure(bg=theme.BG)
+        self.resizable(False, False)
+        self.grab_set()
+        self._build()
+
+    def _build(self):
+        tk.Label(self, text="Export PDF", font=theme.FONT_TITLE,
+                 bg=theme.BG, fg=theme.TEXT, padx=24, pady=16).pack(anchor="w")
+        tk.Frame(self, bg=theme.SEP, height=1).pack(fill="x", padx=24)
+
+        body = tk.Frame(self, bg=theme.BG, padx=24, pady=16)
+        body.pack(fill="both", expand=True)
+
+        # Label
+        tk.Label(body, text="Round label", font=theme.FONT_BOLD,
+                 bg=theme.BG, fg=theme.TEXT).pack(anchor="w")
+        self.label_var = tk.StringVar(value=self.initial_label)
+        styled_entry(body, textvariable=self.label_var, width=40).pack(
+            anchor="w", pady=(4, 14))
+
+        # Orientation — default pulled from user settings. Defaults to
+        # landscape (matching the seating-PDF flow) since activity cards
+        # often have long names + descriptions that read better wide.
+        tk.Label(body, text="Page orientation", font=theme.FONT_BOLD,
+                 bg=theme.BG, fg=theme.TEXT).pack(anchor="w")
+        default_orient = db.get_setting("default_pdf_orientation", "landscape")
+        self.orient_var = tk.StringVar(value=default_orient)
+        orient_row = tk.Frame(body, bg=theme.BG)
+        orient_row.pack(anchor="w", pady=(4, 14))
+        for text, val in [("Landscape", "landscape"), ("Portrait", "portrait")]:
+            tk.Radiobutton(orient_row, text=text, variable=self.orient_var, value=val,
+                           bg=theme.BG, fg=theme.TEXT,
+                           activebackground=theme.BG, activeforeground=theme.TEXT,
+                           selectcolor=theme.GHOST_BG,
+                           font=theme.FONT_BODY).pack(side="left", padx=(0, 16))
+
+        # Show score — default pulled from user settings
+        default_score = db.get_setting("default_pdf_include_score", "0") == "1"
+        self.score_var = tk.BooleanVar(value=default_score)
+        tk.Checkbutton(body, text="Include pair + activity repeat scores",
+                       variable=self.score_var,
+                       bg=theme.BG, fg=theme.TEXT,
+                       activebackground=theme.BG, activeforeground=theme.TEXT,
+                       selectcolor=theme.GHOST_BG,
+                       font=theme.FONT_BODY).pack(anchor="w", pady=(0, 20))
+
+        # Buttons
+        btn_row = tk.Frame(body, bg=theme.BG)
+        btn_row.pack(fill="x")
+        make_btn(btn_row, "Save PDF", self._save,
+                 style="primary", padx=18, pady=9).pack(side="left")
+        make_btn(btn_row, "Cancel", self.destroy,
+                 style="ghost", padx=18, pady=9).pack(side="left", padx=10)
+
+        self.status_lbl = tk.Label(body, text="", font=theme.FONT_SMALL,
+                                   bg=theme.BG, fg=theme.TEXT_DIM)
+        self.status_lbl.pack(anchor="w", pady=(10, 0))
+
+    def _save(self):
+        from tkinter import filedialog
+        label = self.label_var.get().strip() or self.initial_label
+
+        # Default folder resolution mirrors _ExportDialog:
+        #   1. Explicit default_save_folder, if set and still exists
+        #   2. last_save_folder (implicit memory), if set and still exists
+        #   3. ~/Documents fallback baked into default_save_path()
+        default_path = exporter.default_save_path(
+            self.cls.get("name", "Class"), label)
+        init_dir = os.path.dirname(default_path)
+        explicit = db.get_setting("default_save_folder", "")
+        if explicit and os.path.isdir(explicit):
+            init_dir = explicit
+        else:
+            last_used = db.get_setting("last_save_folder", "")
+            if last_used and os.path.isdir(last_used):
+                init_dir = last_used
+
+        out_path = filedialog.asksaveasfilename(
+            parent=self,
+            title="Save Activity Round PDF",
+            initialfile=os.path.basename(default_path),
+            initialdir=init_dir,
+            defaultextension=".pdf",
+            filetypes=[("PDF files", "*.pdf"), ("All files", "*.*")]
+        )
+        if not out_path:
+            return
+
+        self.status_lbl.configure(text="⏳ Generating PDF…", fg=theme.ACCENT)
+        self.update()
+
+        # Fetch round metadata for created_at timestamp
+        round_meta = db.get_activity_round(self.round_id) or {}
+        created_at = round_meta.get("created_at", "")
+
+        try:
+            exporter.export_activity_pdf(
+                round_id=self.round_id,
+                class_name=self.cls.get("name", ""),
+                output_path=out_path,
+                label=label,
+                orientation=self.orient_var.get(),
+                show_score=self.score_var.get(),
+                repeat_score=self.pair_score,
+                activity_repeat_score=self.activity_repeat_score,
+                created_at=created_at)
+            # Remember the save folder
+            try:
+                db.set_setting("last_save_folder",
+                                os.path.dirname(out_path))
+            except Exception:
+                pass
+            self.status_lbl.configure(text=f"✓ Saved to {os.path.basename(out_path)}",
+                                       fg=theme.ACCENT)
+            # Auto-open if the user's pref says so
             if db.get_setting("open_pdf_after_export", "1") == "1":
                 import subprocess, sys
                 if sys.platform == "darwin":
@@ -5319,10 +7053,21 @@ class _ClassDialog(tk.Toplevel):
     def __init__(self, parent, title, existing=None):
         super().__init__(parent)
         self.title(title)
-        # Shorter (content sets height via pack), wider so wrap text fits.
-        # Existing-class edits (no mode picker) fit in a smaller window.
+        # Dialog size depends on which pickers we're showing:
+        #   - New class: seating mode picker visible → tall dialog
+        #   - Edit existing: base dialog is short; grows if the class
+        #     has activities (and thus the pair-history-mode picker
+        #     becomes relevant).
+        has_activities = False
+        if existing and existing.get("id"):
+            try:
+                has_activities = db.class_has_activities(existing["id"])
+            except Exception:
+                has_activities = False
+        self._has_activities_for_pair_mode = has_activities
+
         if existing:
-            self.geometry("500x200")
+            self.geometry("540x380" if has_activities else "500x200")
         else:
             self.geometry("520x340")
         self.configure(bg=theme.BG)
@@ -5387,7 +7132,63 @@ class _ClassDialog(tk.Toplevel):
                      fg=theme.TEXT_DIM, wraplength=320,
                      justify="left").pack(anchor="w", padx=(22, 0))
 
-        btn_row_idx = 3 if not existing else 2
+        # Pair history mode picker — only visible when editing a class
+        # that has at least one activity. Without activities, there's
+        # nothing to combine/separate, so showing this picker is noise.
+        # Default 'combined' matches new classes (set via the DB default).
+        self.pair_history_mode_var = tk.StringVar(
+            value=(existing.get("pair_history_mode", "combined")
+                    if existing else "combined"))
+        show_pair_mode = bool(existing) and self._has_activities_for_pair_mode
+        if show_pair_mode:
+            tk.Label(f, text="Pair history",
+                     font=theme.FONT_BOLD, bg=theme.BG,
+                     fg=theme.TEXT).grid(
+                         row=2, column=0, sticky="nw", pady=(14, 6))
+            ph_frame = tk.Frame(f, bg=theme.BG)
+            ph_frame.grid(row=2, column=1, sticky="w",
+                           padx=10, pady=(14, 6))
+            tk.Radiobutton(
+                ph_frame, text="Combined (recommended)",
+                variable=self.pair_history_mode_var, value="combined",
+                font=theme.FONT_BODY, bg=theme.BG, fg=theme.TEXT,
+                activebackground=theme.BG, activeforeground=theme.TEXT,
+                selectcolor=theme.PANEL, anchor="w",
+                highlightthickness=0, borderwidth=0).pack(anchor="w")
+            tk.Label(ph_frame,
+                     text="Count seating and activity co-occurrences "
+                          "together. The optimizer avoids re-pairing "
+                          "students who've shared a group of any kind.",
+                     font=theme.FONT_SMALL, bg=theme.BG,
+                     fg=theme.TEXT_DIM, wraplength=340,
+                     justify="left").pack(
+                         anchor="w", padx=(22, 0), pady=(0, 6))
+            tk.Radiobutton(
+                ph_frame, text="Separate",
+                variable=self.pair_history_mode_var, value="separate",
+                font=theme.FONT_BODY, bg=theme.BG, fg=theme.TEXT,
+                activebackground=theme.BG, activeforeground=theme.TEXT,
+                selectcolor=theme.PANEL, anchor="w",
+                highlightthickness=0, borderwidth=0).pack(anchor="w")
+            tk.Label(ph_frame,
+                     text="Treat seating and activity rounds independently. "
+                          "Students may end up with the same partners "
+                          "in each round type, since history is tracked "
+                          "separately.",
+                     font=theme.FONT_SMALL, bg=theme.BG,
+                     fg=theme.TEXT_DIM, wraplength=340,
+                     justify="left").pack(anchor="w", padx=(22, 0))
+
+        # Button row index depends on which pickers we shown:
+        #   - New class: seating mode at row 2 → buttons at row 3
+        #   - Edit + has activities: pair mode at row 2 → buttons at row 3
+        #   - Edit + no activities: only rows 0/1 → buttons at row 2
+        if not existing:
+            btn_row_idx = 3
+        elif show_pair_mode:
+            btn_row_idx = 3
+        else:
+            btn_row_idx = 2
         btn_row = tk.Frame(f, bg=theme.BG)
         btn_row.grid(row=btn_row_idx, column=0, columnspan=2, pady=(18, 0))
         make_btn(btn_row, "Save",   self._save,   style="primary").pack(side="left")
@@ -5400,7 +7201,115 @@ class _ClassDialog(tk.Toplevel):
             return
         layout_id = self._layout_map.get(self.layout_var.get(), None)
         mode = self.mode_var.get()
-        self.result = (name, layout_id, mode)
+        # Fourth tuple element is pair_history_mode. Callers that don't
+        # care (new-class flow) can simply ignore it. `None` signals
+        # "no change" — only returned if the picker wasn't shown.
+        if self._has_activities_for_pair_mode:
+            pair_mode = self.pair_history_mode_var.get()
+        else:
+            pair_mode = None
+        self.result = (name, layout_id, mode, pair_mode)
+        self.destroy()
+
+
+class _ActivityDialog(tk.Toplevel):
+    """Create or edit an activity. Name + capacity are required;
+    description is optional. Rejects blank names and zero/negative
+    capacity. Name uniqueness per class is enforced at the DB level;
+    the caller catches IntegrityError and shows a user-facing message."""
+
+    def __init__(self, parent, class_id: int, title: str,
+                  existing: dict | None = None):
+        super().__init__(parent)
+        self.title(title)
+        self.geometry("520x340")
+        self.configure(bg=theme.BG)
+        self.resizable(False, False)
+        self.class_id = class_id
+        self.result: dict | None = None
+        self._existing = existing
+        self._build()
+        self.grab_set()
+
+    def _build(self):
+        f = tk.Frame(self, bg=theme.BG, padx=24, pady=20)
+        f.pack(fill="both", expand=True)
+
+        # Name
+        tk.Label(f, text="Activity name", font=theme.FONT_BOLD,
+                 bg=theme.BG, fg=theme.TEXT).grid(
+                     row=0, column=0, sticky="w", pady=6)
+        self.name_var = tk.StringVar(
+            value=self._existing["name"] if self._existing else "")
+        name_entry = styled_entry(f, textvariable=self.name_var, width=32)
+        name_entry.grid(row=0, column=1, sticky="w", padx=10)
+        name_entry.focus_set()
+
+        # Capacity
+        tk.Label(f, text="Capacity", font=theme.FONT_BOLD,
+                 bg=theme.BG, fg=theme.TEXT).grid(
+                     row=1, column=0, sticky="w", pady=6)
+        cap_frame = tk.Frame(f, bg=theme.BG)
+        cap_frame.grid(row=1, column=1, sticky="w", padx=10)
+        self.capacity_var = tk.StringVar(
+            value=str(self._existing["capacity"]) if self._existing else "4")
+        styled_entry(cap_frame, textvariable=self.capacity_var,
+                      width=8).pack(side="left")
+        tk.Label(cap_frame, text="  students max",
+                 font=theme.FONT_SMALL, bg=theme.BG,
+                 fg=theme.TEXT_DIM).pack(side="left")
+
+        # Description (optional)
+        tk.Label(f, text="Description", font=theme.FONT_BOLD,
+                 bg=theme.BG, fg=theme.TEXT).grid(
+                     row=2, column=0, sticky="nw", pady=(12, 6))
+        dim_label(f, "Optional — shown on the activity card.",
+                   bg=theme.BG).grid(row=3, column=0, sticky="nw")
+        self.description_text = tk.Text(
+            f, height=4, width=34,
+            bg=theme.PANEL, fg=theme.TEXT,
+            insertbackground=theme.TEXT,
+            relief="flat", bd=0,
+            highlightbackground=theme.BORDER,
+            highlightthickness=1,
+            font=theme.FONT_BODY, wrap="word")
+        self.description_text.grid(
+            row=2, column=1, rowspan=2, sticky="w", padx=10, pady=(12, 0))
+        if self._existing and self._existing.get("description"):
+            self.description_text.insert("1.0", self._existing["description"])
+
+        btn_row = tk.Frame(f, bg=theme.BG)
+        btn_row.grid(row=4, column=0, columnspan=2, pady=(18, 0))
+        make_btn(btn_row, "Save",   self._save,
+                 style="primary").pack(side="left")
+        make_btn(btn_row, "Cancel", self.destroy,
+                 style="ghost").pack(side="left", padx=10)
+
+    def _save(self):
+        name = self.name_var.get().strip()
+        if not name:
+            messagebox.showwarning(
+                "Missing Name", "Enter an activity name.", parent=self)
+            return
+        cap_raw = self.capacity_var.get().strip()
+        try:
+            capacity = int(cap_raw)
+        except ValueError:
+            messagebox.showwarning(
+                "Invalid Capacity",
+                "Capacity must be a whole number.", parent=self)
+            return
+        if capacity < 1:
+            messagebox.showwarning(
+                "Invalid Capacity",
+                "Capacity must be at least 1.", parent=self)
+            return
+        description = self.description_text.get("1.0", "end").strip()
+        self.result = {
+            "name":        name,
+            "capacity":    capacity,
+            "description": description,
+        }
         self.destroy()
 
 
@@ -5515,6 +7424,264 @@ class _StudentNameDialog(tk.Toplevel):
             "display":    db.compose_full_name(first, last),
         }
         self.destroy()
+
+
+class _StudentTagsDialog(tk.Toplevel):
+    """Per-student tag assignment dialog.
+
+    Shows one section per tag category defined on the student's class,
+    with a row of value buttons (plus '(none)') that act as a single-
+    select. Selecting a value writes immediately via set_student_tag so
+    teachers don't have to remember to click Save — the dialog is a
+    direct manipulation surface, not a form to submit.
+
+    `self.changed` is True if the student's tags were modified, so the
+    caller can decide whether to refresh the roster (the roster will
+    eventually show tag pills in Step 5).
+    """
+    def __init__(self, parent, student: dict, class_id: int):
+        super().__init__(parent)
+        self.student   = student
+        self.class_id  = class_id
+        self.changed   = False
+        # Resolved categories (with their values) for this class
+        self._categories: list = []
+        # category_id -> currently selected value_id (None if cleared)
+        self._selection: dict[int, int | None] = {}
+        # category_id -> list of (value_dict, button) for visual updates
+        self._value_btns: dict[int, list] = {}
+        # category_id -> the "(none)" button so we can highlight it
+        self._none_btns: dict[int, tk.Widget] = {}
+
+        display = student.get("display") or student.get("name") or "Student"
+        self.title(f"Tags — {display}")
+        self.geometry("560x520")
+        self.configure(bg=theme.BG)
+        self.resizable(True, True)
+        self.grab_set()
+        self._build()
+
+    # ── Layout ────────────────────────────────────────────────────────────
+
+    def _build(self):
+        # Title strip
+        title_frame = tk.Frame(self, bg=theme.BG, padx=24, pady=16)
+        title_frame.pack(fill="x")
+        display = self.student.get("display") or self.student.get("name") or ""
+        tk.Label(title_frame, text=f"Tags — {display}",
+                 font=theme.FONT_TITLE,
+                 bg=theme.BG, fg=theme.TEXT).pack(anchor="w")
+        dim_label(title_frame,
+                  "Select one value per category, or leave as "
+                  "“(none)”. Changes save automatically.",
+                  wraplength=480).pack(anchor="w", pady=(4, 0))
+        tk.Frame(self, bg=theme.SEP, height=1).pack(fill="x", padx=24)
+
+        # Load tag categories + values + student's current selections
+        self._categories = db.get_tag_categories_for_class(self.class_id)
+        for cat in self._categories:
+            cat["values"] = db.get_tag_values_for_category(cat["id"])
+        current_tags = db.get_tags_for_student(self.student["id"])
+        self._selection = {cat["id"]: None for cat in self._categories}
+        for t in current_tags:
+            # category_id may be defined for a value the student has;
+            # store the value_id so we render it as selected.
+            self._selection[t["category_id"]] = t["value_id"]
+
+        # Empty state — class has no tags defined yet
+        if not self._categories:
+            empty = tk.Frame(self, bg=theme.BG, padx=24, pady=32)
+            empty.pack(fill="both", expand=True)
+            tk.Label(empty, text="🏷️", font=("Helvetica", 36),
+                     bg=theme.BG, fg=theme.TEXT_DIM).pack(pady=(0, 8))
+            tk.Label(empty,
+                      text="No tag categories defined for this class.",
+                      font=theme.FONT_BOLD,
+                      bg=theme.BG, fg=theme.TEXT).pack()
+            dim_label(empty,
+                      "Use the 🏷️ Tags button in the roster header to "
+                      "create categories like Reading Level or Grade.",
+                      wraplength=460,
+                      justify="center").pack(pady=(8, 16))
+            make_btn(empty, "Close", self.destroy,
+                     style="ghost", padx=18, pady=9).pack()
+            return
+
+        # Scrollable category list. Many classes will have only 1–3
+        # categories so this is overkill for most cases, but anything
+        # more than 4–5 needs scrolling on a typical macOS window.
+        outer = tk.Frame(self, bg=theme.BG)
+        outer.pack(fill="both", expand=True, padx=24, pady=(14, 0))
+        canvas = tk.Canvas(outer, bg=theme.BG, highlightthickness=0,
+                            yscrollincrement=8)
+        canvas.pack(side="left", fill="both", expand=True)
+        # Always-visible scrollbar on macOS (dynamic pack causes SIGSEGV)
+        scroll = tk.Scrollbar(outer, orient="vertical",
+                               command=canvas.yview)
+        scroll.pack(side="right", fill="y")
+        canvas.configure(yscrollcommand=scroll.set)
+
+        inner = tk.Frame(canvas, bg=theme.BG)
+        inner_id = canvas.create_window((0, 0), window=inner, anchor="nw")
+
+        # Wheel forwarding so the scrollbar is reachable from anywhere
+        # in the dialog
+        def _on_wheel(event):
+            step = -1 if event.delta > 0 else 1
+            canvas.yview_scroll(step, "units")
+            return "break"
+        canvas.bind("<MouseWheel>", _on_wheel)
+        inner.bind("<MouseWheel>",  _on_wheel)
+
+        def _on_inner_config(_e=None):
+            canvas.configure(scrollregion=canvas.bbox("all"))
+        def _on_canvas_config(e):
+            canvas.itemconfigure(inner_id, width=e.width)
+        inner.bind("<Configure>", _on_inner_config)
+        canvas.bind("<Configure>", _on_canvas_config)
+
+        for cat in self._categories:
+            self._render_category_section(inner, cat)
+
+        # Bottom bar: OK (primary) and Close (ghost). Both destroy the
+        # dialog — there's no "discard" path since changes save on click.
+        # The OK button reads as confirmation; some teachers will reach
+        # for it instinctively after picking values, even though there's
+        # nothing to commit.
+        bar = tk.Frame(self, bg=theme.BG, padx=24, pady=14)
+        bar.pack(side="bottom", fill="x")
+        tk.Frame(self, bg=theme.SEP, height=1).pack(side="bottom",
+                                                       fill="x", padx=24)
+        make_btn(bar, "✓ OK", self.destroy,
+                 style="primary", padx=18, pady=9).pack(side="right")
+        make_btn(bar, "Close", self.destroy,
+                 style="ghost", padx=18, pady=9).pack(side="right",
+                                                        padx=(0, 8))
+
+    def _render_category_section(self, parent, cat: dict):
+        """Render one category's section: header + value buttons row.
+
+        cat keys: id, name, operation, values (list of {id, value, color})
+        """
+        OP_LABELS = {
+            "ignore":     "No effect",
+            "distribute": "Distribute",
+            "cluster":    "Cluster",
+            "keep_apart": "Keep apart",
+        }
+
+        wrap = tk.Frame(parent, bg=theme.BG, pady=10)
+        wrap.pack(fill="x", anchor="w")
+
+        # Header row
+        hdr = tk.Frame(wrap, bg=theme.BG)
+        hdr.pack(fill="x", anchor="w")
+        tk.Label(hdr, text=cat["name"], font=theme.FONT_BOLD,
+                 bg=theme.BG, fg=theme.TEXT).pack(side="left")
+        # Operation pill — small dim badge
+        op_text = OP_LABELS.get(cat["operation"], cat["operation"])
+        tk.Label(hdr, text=f" · {op_text}", font=theme.FONT_SMALL,
+                 bg=theme.BG, fg=theme.TEXT_DIM).pack(side="left",
+                                                         padx=(4, 0))
+
+        # Value row — buttons. Using a wrap-row pattern so values flow
+        # to a second line if there are many. Tk doesn't have a native
+        # flow layout, so we pack with side="left" and let the parent
+        # be narrow enough; clean enough for typical 2–6 values per
+        # category.
+        values_frame = tk.Frame(wrap, bg=theme.BG)
+        values_frame.pack(fill="x", pady=(6, 0))
+
+        self._value_btns[cat["id"]] = []
+        # "(none)" first so it's a consistent left-most option
+        none_btn = self._make_value_button(
+            values_frame, cat["id"], None, "(none)", None)
+        none_btn.pack(side="left", padx=(0, 6), pady=2)
+        self._none_btns[cat["id"]] = none_btn
+
+        for v in cat["values"]:
+            b = self._make_value_button(
+                values_frame, cat["id"], v["id"], v["value"], v.get("color"))
+            b.pack(side="left", padx=(0, 6), pady=2)
+            self._value_btns[cat["id"]].append((v, b))
+
+        # Sync the visual state to the currently-loaded selection
+        self._refresh_category_buttons(cat["id"])
+
+    def _make_value_button(self, parent, category_id: int,
+                              value_id: int | None, label: str,
+                              color: str | None) -> tk.Widget:
+        """Build one value-pill button. Clicking selects this value for
+        the category (or clears it if value_id is None). Uses a frame
+        wrapper so we can put a color swatch before the label."""
+        # The container frame doubles as the click target so the whole
+        # pill is interactive.
+        frame = tk.Frame(parent, bg=theme.GHOST_BG, cursor="hand2",
+                          padx=8, pady=4,
+                          highlightthickness=1,
+                          highlightbackground=theme.BORDER)
+        # Color swatch only for actual values (not "(none)"). We use
+        # a Canvas because tk.Frame with fixed dimensions + pack
+        # requires pack_propagate(False), which we ban (it interacts
+        # badly with width-set widgets on macOS Tk).
+        if color:
+            swatch = tk.Canvas(frame, width=10, height=10,
+                                bg=color,
+                                highlightthickness=1,
+                                highlightbackground=theme.BORDER)
+            swatch.pack(side="left", padx=(0, 6))
+        lbl = tk.Label(frame, text=label, font=theme.FONT_BODY,
+                        bg=theme.GHOST_BG, fg=theme.TEXT)
+        lbl.pack(side="left")
+
+        def _click(_e=None):
+            self._select_value(category_id, value_id)
+        for w in (frame, lbl):
+            w.bind("<Button-1>", _click)
+        return frame
+
+    def _refresh_category_buttons(self, category_id: int):
+        """Update the visual state of buttons in a category so the
+        currently-selected value reads as highlighted."""
+        selected_vid = self._selection.get(category_id)
+
+        def _style(widget: tk.Widget, selected: bool):
+            bg     = theme.ACCENT if selected else theme.GHOST_BG
+            fg     = theme.ACCENT_TEXT if selected else theme.TEXT
+            border = theme.ACCENT if selected else theme.BORDER
+            widget.configure(bg=bg, highlightbackground=border)
+            for child in widget.winfo_children():
+                if isinstance(child, tk.Label):
+                    child.configure(bg=bg, fg=fg)
+
+        # "(none)" button
+        none_btn = self._none_btns.get(category_id)
+        if none_btn is not None:
+            _style(none_btn, selected_vid is None)
+
+        # Value buttons
+        for v, btn in self._value_btns.get(category_id, []):
+            _style(btn, v["id"] == selected_vid)
+
+    def _select_value(self, category_id: int, value_id: int | None):
+        """Persist a value selection for this category and refresh the
+        visual state. Writes immediately — no Save step required."""
+        if self._selection.get(category_id) == value_id:
+            # No-op: clicking the already-selected pill keeps the
+            # selection. (Could be a deselect-toggle for None, but
+            # then the user has no way to UNDO an accidental click
+            # without re-clicking "(none)" — which is fine UX.)
+            return
+        try:
+            db.set_student_tag(self.student["id"], category_id, value_id)
+        except Exception as e:
+            messagebox.showerror("Could Not Save Tag",
+                                 f"Failed to save tag: {e}",
+                                 parent=self)
+            return
+        self._selection[category_id] = value_id
+        self.changed = True
+        self._refresh_category_buttons(category_id)
 
 
 # ── Bulk Import Dialog ────────────────────────────────────────────────────────
@@ -6090,6 +8257,195 @@ class _PinStudentDialog(tk.Toplevel):
         self.destroy()
 
 
+class _ActivityPinDialog(tk.Toplevel):
+    """Manage a student's activity pin and activity exclusions.
+
+    This is a simple form dialog — no room canvas, no spatial picker —
+    because activities aren't spatial. Teachers choose an activity to
+    pin the student to (or "(not pinned)") and check off activities the
+    student should NEVER be assigned to.
+
+    State:
+      - self.saved = True iff the teacher clicked Save (not Cancel)
+      - self.new_pin_id: int | None — activity to pin to, or None
+      - self.new_exclusions: set[int] — activity IDs to exclude from
+
+    Caller is responsible for persisting these via db.set_student_activity_pin
+    and db.add_activity_exclusion / db.remove_activity_exclusion.
+    """
+
+    def __init__(self, parent, student_name: str, class_id: int,
+                  student_id: int,
+                  current_pin_id: int | None,
+                  current_exclusion_ids: list[int]):
+        super().__init__(parent)
+        self.student_name = student_name
+        self.class_id     = class_id
+        self.student_id   = student_id
+        self.current_pin_id = current_pin_id
+        self.current_exclusions: set = set(current_exclusion_ids)
+
+        self.saved = False
+        self.new_pin_id: int | None = current_pin_id
+        self.new_exclusions: set = set(current_exclusion_ids)
+
+        # Load all activities for this class (including archived, for
+        # completeness — a student might be pinned to an archived activity
+        # historically, though we discourage it).
+        self.activities = db.get_activities_for_class(
+            class_id, include_archived=False)
+
+        self.title(f"Activity Pin / Exclusions — {student_name}")
+        self.geometry("520x480")
+        self.configure(bg=theme.BG)
+        self.resizable(False, True)
+        self.grab_set()
+        self._build()
+
+    def _build(self):
+        # Header
+        hdr = tk.Frame(self, bg=theme.BG, padx=24, pady=16)
+        hdr.pack(fill="x")
+        tk.Label(hdr, text=f"Activity settings — {self.student_name}",
+                 font=theme.FONT_TITLE, bg=theme.BG, fg=theme.TEXT).pack(
+                     anchor="w")
+        tk.Label(hdr,
+                 text="Control how this student is assigned in activity "
+                      "rounds.",
+                 font=theme.FONT_SMALL, bg=theme.BG, fg=theme.TEXT_DIM,
+                 anchor="w", wraplength=460,
+                 justify="left").pack(anchor="w", pady=(2, 0))
+        tk.Frame(self, bg=theme.SEP, height=1).pack(fill="x", padx=24)
+
+        # Bottom bar (Save / Cancel)
+        bottom = tk.Frame(self, bg=theme.BG, padx=24, pady=14)
+        bottom.pack(side="bottom", fill="x")
+        make_btn(bottom, "Save", self._save,
+                 style="primary", padx=18, pady=9).pack(side="left")
+        make_btn(bottom, "Cancel", self.destroy,
+                 style="ghost", padx=18, pady=9).pack(side="left", padx=10)
+
+        # If class has no activities at all, show a gentle explainer
+        # (shouldn't reach this dialog normally — _do_pin_student gates
+        # it — but handle gracefully just in case).
+        if not self.activities:
+            body = tk.Frame(self, bg=theme.BG, padx=24, pady=20)
+            body.pack(fill="both", expand=True)
+            tk.Label(body,
+                     text="This class has no activities defined yet. "
+                          "Create activities in the Activity Rounds tab "
+                          "to enable activity pins and exclusions.",
+                     font=theme.FONT_BODY, bg=theme.BG,
+                     fg=theme.TEXT_DIM, wraplength=440,
+                     justify="left").pack(anchor="w")
+            return
+
+        # Body: activity pin + exclusion list
+        body = tk.Frame(self, bg=theme.BG, padx=24, pady=16)
+        body.pack(fill="both", expand=True)
+
+        # ── Activity pin section ────────────────────────────────────────
+        tk.Label(body, text="Pinned activity",
+                 font=theme.FONT_BOLD, bg=theme.BG,
+                 fg=theme.TEXT).pack(anchor="w")
+        tk.Label(body,
+                 text="This student will always be placed in this activity "
+                      "during activity rounds. Leave as (none) to let the "
+                      "optimizer choose.",
+                 font=theme.FONT_SMALL, bg=theme.BG,
+                 fg=theme.TEXT_DIM, wraplength=460,
+                 justify="left", anchor="w").pack(anchor="w", pady=(2, 6))
+
+        # Dropdown: (none) + each activity
+        pin_options = ["(none)"] + [a["name"] for a in self.activities]
+        current_name = "(none)"
+        if self.current_pin_id is not None:
+            match = next((a for a in self.activities
+                           if a["id"] == self.current_pin_id), None)
+            if match:
+                current_name = match["name"]
+        self.pin_var = tk.StringVar(value=current_name)
+        ttk.Combobox(body, textvariable=self.pin_var,
+                     values=pin_options, state="readonly",
+                     width=40).pack(anchor="w", pady=(0, 18))
+
+        # ── Exclusions section ──────────────────────────────────────────
+        tk.Label(body, text="Exclude from these activities",
+                 font=theme.FONT_BOLD, bg=theme.BG,
+                 fg=theme.TEXT).pack(anchor="w")
+        tk.Label(body,
+                 text="The optimizer will never assign this student to "
+                      "checked activities.",
+                 font=theme.FONT_SMALL, bg=theme.BG,
+                 fg=theme.TEXT_DIM, wraplength=460,
+                 justify="left", anchor="w").pack(anchor="w", pady=(2, 6))
+
+        # Scrollable checklist of activities
+        list_container = tk.Frame(body, bg=theme.BG,
+                                    highlightbackground=theme.BORDER,
+                                    highlightthickness=1)
+        list_container.pack(fill="both", expand=True)
+
+        style = ttk.Style()
+        style.configure("ActPin.Treeview", rowheight=28,
+                        font=theme.FONT_BODY)
+
+        # Small treeview acting as a checkbox list. Click row = toggle.
+        self._excl_tree = ttk.Treeview(
+            list_container, columns=("check", "name"),
+            show="tree",
+            style="ActPin.Treeview",
+            height=max(3, min(8, len(self.activities))))
+        self._excl_tree.column("#0", width=30, stretch=False, anchor="center")
+        self._excl_tree.pack(fill="both", expand=True)
+
+        for a in self.activities:
+            checked = a["id"] in self.new_exclusions
+            self._excl_tree.insert(
+                "", "end", iid=str(a["id"]),
+                text="☑" if checked else "☐",
+                values=("", f"{a['name']}  ({a['capacity']} max)"))
+
+        self._excl_tree.bind("<Button-1>", self._toggle_exclusion)
+
+    def _toggle_exclusion(self, event):
+        row = self._excl_tree.identify_row(event.y)
+        if not row:
+            return
+        try:
+            aid = int(row)
+        except ValueError:
+            return
+        if aid in self.new_exclusions:
+            self.new_exclusions.discard(aid)
+            self._excl_tree.item(row, text="☐")
+        else:
+            self.new_exclusions.add(aid)
+            self._excl_tree.item(row, text="☑")
+
+    def _save(self):
+        # Resolve selected activity back to ID
+        selected_name = self.pin_var.get()
+        if selected_name == "(none)":
+            self.new_pin_id = None
+        else:
+            match = next((a for a in self.activities
+                           if a["name"] == selected_name), None)
+            self.new_pin_id = match["id"] if match else None
+
+        # Sanity: don't allow pin + exclusion on the same activity
+        if self.new_pin_id is not None and self.new_pin_id in self.new_exclusions:
+            messagebox.showwarning(
+                "Conflict",
+                f"{self.student_name} is pinned to this activity and also "
+                "excluded from it. Remove one of the two before saving.",
+                parent=self)
+            return
+
+        self.saved = True
+        self.destroy()
+
+
 # ── Constraints Dialog ────────────────────────────────────────────────────────
 
 class _ConstraintsDialog(tk.Toplevel):
@@ -6251,77 +8607,1187 @@ class _ConstraintsDialog(tk.Toplevel):
         self._refresh()
 
 
-# ── Stats Window ──────────────────────────────────────────────────────────────
+# ── Tag Rules Dialog ──────────────────────────────────────────────────────────
 
-class _StatsWindow(tk.Toplevel):
+class _TagRulesDialog(tk.Toplevel):
+    """Manage student tag categories + their values for a class.
+
+    Left pane: category list. Right pane: selected category's details
+    (rename, operation, value list with color picker). Category-level
+    operations say what the optimizer should do with students sharing
+    a value — see db.TAG_OPERATIONS.
+
+    self.changed is True if anything was created/updated/deleted — the
+    caller uses it to decide whether to refresh the roster.
     """
-    Full stats dashboard launched from the Rounds tab.
-    Shows:
-      - L1 headline metrics with confidence-labeled projection
-      - L2 per-student section (dropdown -> who they've paired with / not)
-      - L3 pairing heat map (N x N, click a cell for that pair's history)
-    """
-    def __init__(self, parent, class_id: int, cls: dict):
+    OPERATIONS = [
+        ("ignore",      "No effect (informational only)"),
+        ("distribute",  "Distribute evenly across groups"),
+        ("cluster",     "Cluster same value together"),
+        ("keep_apart",  "Keep same value apart"),
+    ]
+
+    # Default palette offered in the color picker. Teachers can still
+    # enter a custom hex, but these cover common "color-coding" use
+    # cases without forcing a system color dialog.
+    DEFAULT_COLORS = [
+        "#3b82f6",  # blue
+        "#ec4899",  # pink
+        "#10b981",  # green
+        "#f59e0b",  # amber
+        "#8b5cf6",  # violet
+        "#ef4444",  # red
+        "#14b8a6",  # teal
+        "#f97316",  # orange
+        "#6366f1",  # indigo
+        "#84cc16",  # lime
+        "#a855f7",  # purple
+        "#06b6d4",  # cyan
+    ]
+
+    def __init__(self, parent, class_id: int):
         super().__init__(parent)
         self.class_id = class_id
-        self.cls      = cls
-        self.title(f"📊  Stats — {cls['name']}")
-        self.geometry("820x720")
+        self.changed  = False
+        # Currently selected category id, or None for empty state
+        self._selected_cat_id: int | None = None
+        # Dirty tracking for the operation radio buttons — writes to DB
+        # on blur, not per-keystroke, to keep the UX snappy
+        self._op_var: tk.StringVar | None = None
+        self._name_var: tk.StringVar | None = None
+
+        self.title("Tag Rules")
+        self.geometry("920x620")
         self.configure(bg=theme.BG)
         self.resizable(True, True)
-        # Cache data once on open so we're not re-querying repeatedly
-        self.stats    = db.get_pair_stats(class_id)
+        self.grab_set()
+        self._build()
+        self._refresh_cat_list()
+        # Auto-select first category if any exist
+        cats = db.get_tag_categories_for_class(self.class_id)
+        if cats:
+            self._select_category(cats[0]["id"])
+
+    # ── Layout ────────────────────────────────────────────────────────────
+
+    def _build(self):
+        # Title
+        tk.Label(self, text="Tag Rules", font=theme.FONT_TITLE,
+                 bg=theme.BG, fg=theme.TEXT, padx=24, pady=16).pack(anchor="w")
+        tk.Frame(self, bg=theme.SEP, height=1).pack(fill="x", padx=24)
+
+        # Short helper note explaining what tags do. Keeps teachers
+        # from having to guess at the operation meanings. wraplength
+        # is set generously so the note wraps cleanly on any window
+        # width the dialog's resizable to.
+        dim_label(
+            self,
+            "Tag categories label students with values that influence "
+            "grouping. Operations are soft — they nudge the optimizer "
+            "without overriding pair rules or pins.",
+            wraplength=860, justify="left",
+        ).pack(anchor="w", padx=24, pady=(8, 4))
+
+        # Bottom bar (always visible Close + tip). Tip lives here
+        # rather than inside the scrollable detail pane so it stays
+        # anchored and visible regardless of how many values are in
+        # the currently-selected category.
+        bottom = tk.Frame(self, bg=theme.BG, padx=24, pady=12)
+        bottom.pack(side="bottom", fill="x")
+        make_btn(bottom, "Close", self.destroy,
+                 style="ghost", padx=14, pady=6).pack(side="right")
+        tk.Label(bottom, text="Tip: Tab or Enter to save name changes.",
+                 font=theme.FONT_SMALL, bg=theme.BG,
+                 fg=theme.TEXT_MUTED).pack(side="left")
+
+        # Body: two panes side by side
+        body = tk.Frame(self, bg=theme.BG, padx=24, pady=12)
+        body.pack(fill="both", expand=True)
+
+        # ── Left pane: category list ──────────────────────────────────
+        left = tk.Frame(body, bg=theme.PANEL,
+                         highlightbackground=theme.BORDER,
+                         highlightthickness=1)
+        left.pack(side="left", fill="y", padx=(0, 12))
+
+        left_header = tk.Frame(left, bg=theme.PANEL, padx=12, pady=10)
+        left_header.pack(fill="x")
+        tk.Label(left_header, text="Categories",
+                 font=theme.FONT_BOLD, bg=theme.PANEL,
+                 fg=theme.TEXT).pack(side="left")
+        make_btn(left_header, "+", self._new_category,
+                 style="primary", padx=10, pady=4).pack(side="right")
+
+        tk.Frame(left, bg=theme.SEP, height=1).pack(fill="x")
+
+        # Scrollable category list (canvas-based for stable macOS behavior)
+        list_host = tk.Frame(left, bg=theme.PANEL, width=220)
+        list_host.pack(fill="both", expand=True)
+        list_host.pack_propagate(False)
+        self._cat_canvas = tk.Canvas(list_host, bg=theme.PANEL,
+                                       bd=0, highlightthickness=0,
+                                       width=220,
+                                       yscrollincrement=8)
+        cat_sb = ttk.Scrollbar(list_host, orient="vertical",
+                                command=self._cat_canvas.yview)
+        self._cat_canvas.configure(yscrollcommand=cat_sb.set)
+        cat_sb.pack(side="right", fill="y")
+        self._cat_canvas.pack(side="left", fill="both", expand=True)
+        self._cat_list_frame = tk.Frame(self._cat_canvas, bg=theme.PANEL)
+        self._cat_list_window = self._cat_canvas.create_window(
+            (0, 0), window=self._cat_list_frame, anchor="nw")
+
+        def _on_cat_cfg(e):
+            try:
+                self._cat_canvas.itemconfigure(self._cat_list_window,
+                                                 width=e.width)
+            except tk.TclError:
+                pass
+            try:
+                self._cat_canvas.configure(
+                    scrollregion=self._cat_canvas.bbox("all"))
+            except tk.TclError:
+                pass
+        self._cat_canvas.bind("<Configure>", _on_cat_cfg)
+        self._cat_list_frame.bind(
+            "<Configure>",
+            lambda e: self._cat_canvas.configure(
+                scrollregion=self._cat_canvas.bbox("all")))
+
+        # Wheel scroll for the category list
+        def _cat_wheel(e):
+            delta = getattr(e, "delta", 0)
+            if delta == 0:
+                return
+            step = -1 if delta > 0 else 1
+            try:
+                self._cat_canvas.yview_scroll(step, "units")
+            except tk.TclError:
+                pass
+            return "break"
+        self._cat_canvas.bind("<MouseWheel>", _cat_wheel)
+
+        # ── Right pane: category detail (scrollable) ─────────────────
+        # A canvas-based scroll wrap around the detail widgets so
+        # categories with many values don't overflow the dialog.
+        detail_host = tk.Frame(body, bg=theme.BG)
+        detail_host.pack(side="left", fill="both", expand=True)
+        self._detail_canvas = tk.Canvas(detail_host, bg=theme.BG,
+                                          bd=0, highlightthickness=0,
+                                          yscrollincrement=8)
+        detail_sb = ttk.Scrollbar(detail_host, orient="vertical",
+                                    command=self._detail_canvas.yview)
+        self._detail_canvas.configure(yscrollcommand=detail_sb.set)
+        detail_sb.pack(side="right", fill="y")
+        self._detail_canvas.pack(side="left", fill="both", expand=True)
+        self._detail = tk.Frame(self._detail_canvas, bg=theme.BG,
+                                  padx=18, pady=4)
+        self._detail_window = self._detail_canvas.create_window(
+            (0, 0), window=self._detail, anchor="nw")
+
+        def _on_detail_cfg(e):
+            # Match inner frame width to canvas width so content
+            # doesn't get cropped horizontally.
+            try:
+                self._detail_canvas.itemconfigure(self._detail_window,
+                                                    width=e.width)
+            except tk.TclError:
+                pass
+        self._detail_canvas.bind("<Configure>", _on_detail_cfg)
+        self._detail.bind(
+            "<Configure>",
+            lambda e: self._detail_canvas.configure(
+                scrollregion=self._detail_canvas.bbox("all")))
+
+        # Wheel scroll for detail pane — normalized step to match the
+        # other scrollable views in the app.
+        def _detail_wheel(e):
+            delta = getattr(e, "delta", 0)
+            if delta == 0:
+                return
+            step = -1 if delta > 0 else 1
+            try:
+                self._detail_canvas.yview_scroll(step, "units")
+            except tk.TclError:
+                pass
+            return "break"
+        self._detail_canvas.bind("<MouseWheel>", _detail_wheel)
+        # Recursive wheel forwarding populated after each render so
+        # wheel works when pointer is hovering over content.
+        self._detail_wheel_handler = _detail_wheel
+
+        # Start with empty state; filled in by _select_category
+        self._render_empty_state()
+
+    # ── Category list ─────────────────────────────────────────────────────
+
+    def _refresh_cat_list(self):
+        """Redraw the category list on the left."""
+        for w in self._cat_list_frame.winfo_children():
+            w.destroy()
+
+        cats = db.get_tag_categories_for_class(self.class_id)
+        if not cats:
+            tk.Label(self._cat_list_frame,
+                     text="No categories yet.\nClick + to add one.",
+                     font=theme.FONT_SMALL, bg=theme.PANEL,
+                     fg=theme.TEXT_MUTED, justify="left",
+                     padx=12, pady=14).pack(anchor="w")
+            return
+
+        for cat in cats:
+            self._render_cat_row(cat)
+
+    def _render_cat_row(self, cat: dict):
+        """One clickable row in the category list."""
+        selected = (cat["id"] == self._selected_cat_id)
+        bg = theme.GHOST_BG if selected else theme.PANEL
+        row = tk.Frame(self._cat_list_frame, bg=bg, padx=12, pady=8)
+        row.pack(fill="x")
+
+        name_lbl = tk.Label(row, text=cat["name"],
+                             font=theme.FONT_BODY if not selected
+                                  else theme.FONT_BOLD,
+                             bg=bg, fg=theme.TEXT, anchor="w")
+        name_lbl.pack(anchor="w")
+
+        # Operation + value count summary under the name
+        val_count = len(db.get_tag_values_for_category(cat["id"]))
+        op_display = self._op_display_name(cat["operation"])
+        summary = f"{op_display}  ·  {val_count} value{'s' if val_count != 1 else ''}"
+        tk.Label(row, text=summary,
+                 font=theme.FONT_SMALL, bg=bg,
+                 fg=theme.TEXT_DIM, anchor="w").pack(anchor="w")
+
+        # Click to select — bind on the row frame AND child labels so
+        # clicks anywhere in the row register. Selection is the only
+        # interaction at the row level; actions live in the detail pane.
+        def _on_click(_e, cid=cat["id"]):
+            self._select_category(cid)
+        for w in (row, name_lbl, *row.winfo_children()):
+            try:
+                w.bind("<Button-1>", _on_click)
+            except tk.TclError:
+                pass
+
+    def _op_display_name(self, op: str) -> str:
+        for key, label in self.OPERATIONS:
+            if key == op:
+                # Short form for summary lines
+                return {
+                    "ignore":     "Ignore",
+                    "distribute": "Distribute",
+                    "cluster":    "Cluster",
+                    "keep_apart": "Keep apart",
+                }.get(key, label)
+        return op
+
+    def _select_category(self, cat_id: int):
+        """Select a category and render its detail pane."""
+        self._selected_cat_id = cat_id
+        self._refresh_cat_list()
+        self._render_detail(cat_id)
+
+    # ── Detail pane ───────────────────────────────────────────────────────
+
+    def _render_empty_state(self):
+        for w in self._detail.winfo_children():
+            w.destroy()
+        f = tk.Frame(self._detail, bg=theme.BG)
+        f.pack(expand=True)
+        tk.Label(f, text="🏷️",
+                 font=("Helvetica", 48), bg=theme.BG,
+                 fg=theme.TEXT_DIM).pack(pady=(40, 8))
+        tk.Label(f, text="Select or create a category",
+                 font=theme.FONT_BOLD, bg=theme.BG,
+                 fg=theme.TEXT_DIM).pack()
+        tk.Label(f,
+                 text="Categories group related tags — like Reading Level\n"
+                      "(advanced, on-grade, support) or Grade Level (6th, 7th, 8th).",
+                 font=theme.FONT_SMALL, bg=theme.BG,
+                 fg=theme.TEXT_MUTED, justify="center").pack(pady=(4, 0))
+
+    def _render_detail(self, cat_id: int):
+        cat = db.get_tag_category(cat_id)
+        if not cat:
+            self._selected_cat_id = None
+            self._render_empty_state()
+            return
+
+        for w in self._detail.winfo_children():
+            w.destroy()
+
+        # Header: name editor + delete button
+        header = tk.Frame(self._detail, bg=theme.BG, pady=4)
+        header.pack(fill="x")
+        tk.Label(header, text="Name",
+                 font=theme.FONT_SMALL, bg=theme.BG,
+                 fg=theme.TEXT_DIM).pack(anchor="w")
+        name_row = tk.Frame(header, bg=theme.BG)
+        name_row.pack(fill="x", pady=(2, 0))
+        self._name_var = tk.StringVar(value=cat["name"])
+        name_entry = styled_entry(name_row, textvariable=self._name_var,
+                                    width=40)
+        name_entry.pack(side="left", fill="x", expand=True)
+        # Persist name on blur / Enter. On Enter specifically, drop
+        # focus back to the dialog so the field visually "releases"
+        # as a confirmation signal.
+        name_entry.bind("<FocusOut>",
+                         lambda e, c=cat_id: self._save_name(c))
+        name_entry.bind("<Return>",
+                         lambda e, c=cat_id: (self._save_name(c),
+                                                 self.focus_set()))
+        make_btn(name_row, "Delete category",
+                 lambda c=cat_id: self._delete_category(c),
+                 style="danger", padx=10, pady=5).pack(side="right",
+                                                         padx=(8, 0))
+
+        # Operation picker
+        op_frame = tk.Frame(self._detail, bg=theme.BG, pady=12)
+        op_frame.pack(fill="x")
+        tk.Label(op_frame, text="Optimizer behavior",
+                 font=theme.FONT_SMALL, bg=theme.BG,
+                 fg=theme.TEXT_DIM).pack(anchor="w")
+        self._op_var = tk.StringVar(value=cat["operation"])
+        for key, label in self.OPERATIONS:
+            tk.Radiobutton(op_frame, text=label, variable=self._op_var,
+                           value=key,
+                           bg=theme.BG, fg=theme.TEXT,
+                           activebackground=theme.BG,
+                           activeforeground=theme.TEXT,
+                           selectcolor=theme.GHOST_BG,
+                           font=theme.FONT_BODY,
+                           command=lambda c=cat_id: self._save_operation(c)
+                           ).pack(anchor="w", pady=1)
+
+        tk.Frame(self._detail, bg=theme.SEP, height=1).pack(fill="x",
+                                                               pady=(8, 12))
+
+        # Values section
+        vheader = tk.Frame(self._detail, bg=theme.BG)
+        vheader.pack(fill="x")
+        tk.Label(vheader, text="Values",
+                 font=theme.FONT_BOLD, bg=theme.BG,
+                 fg=theme.TEXT).pack(side="left")
+        make_btn(vheader, "+ Value",
+                 lambda c=cat_id: self._new_value(c),
+                 style="primary", padx=10, pady=5).pack(side="right")
+
+        # Scrollable list of values for this category
+        values = db.get_tag_values_for_category(cat_id)
+        if not values:
+            tk.Label(self._detail,
+                     text="No values yet. Add one (e.g. 'advanced').",
+                     font=theme.FONT_SMALL, bg=theme.BG,
+                     fg=theme.TEXT_MUTED, pady=10).pack(anchor="w")
+            return
+
+        # Simple list. Dialog's scrollable detail pane handles overflow
+        # when a category has many values.
+        val_box = tk.Frame(self._detail, bg=theme.BG, pady=6)
+        val_box.pack(fill="x")
+        for v in values:
+            self._render_value_row(val_box, v, cat_id)
+
+        # Recursively forward wheel events so scrolling works when the
+        # pointer is over any detail content, not just empty canvas.
+        self._bind_detail_wheel(self._detail)
+
+    def _bind_detail_wheel(self, widget):
+        """Recursively bind wheel forwarding on every descendant of the
+        detail pane. Called after _render_detail rebuilds so new widgets
+        get the handler."""
+        try:
+            widget.bind("<MouseWheel>",
+                         self._detail_wheel_handler, add="+")
+            for child in widget.winfo_children():
+                self._bind_detail_wheel(child)
+        except tk.TclError:
+            pass
+
+    def _render_value_row(self, parent, val: dict, cat_id: int):
+        """One editable row for a value: swatch + name + color picker + delete.
+
+        Rename is inline — edit the text, then Tab or Enter to save.
+        We update the Entry's StringVar in place on successful save
+        rather than rebuilding the whole detail pane (which previously
+        caused a focus race where the newly-rebuilt Entry appeared
+        blank until clicked).
+        """
+        row = tk.Frame(parent, bg=theme.PANEL,
+                        highlightbackground=theme.BORDER,
+                        highlightthickness=1, padx=10, pady=6)
+        row.pack(fill="x", pady=3)
+
+        # Color swatch (acts as clickable color picker)
+        swatch_color = val.get("color") or theme.BORDER
+        swatch = tk.Frame(row, bg=swatch_color, width=22, height=22,
+                           highlightbackground=theme.TEXT_DIM,
+                           highlightthickness=1, cursor="hand2")
+        swatch.pack(side="left", padx=(0, 10))
+        swatch.pack_propagate(False)
+        swatch.bind("<Button-1>",
+                     lambda e, v=val: self._pick_color(v))
+
+        # Value name editor (inline)
+        name_var = tk.StringVar(value=val["value"])
+        entry = styled_entry(row, textvariable=name_var, width=20)
+        entry.pack(side="left", fill="x", expand=True)
+
+        # Track the last-saved value on the closure so we can skip
+        # no-op saves (e.g. Tab after Enter triggers FocusOut even
+        # though nothing changed).
+        current_name = {"value": val["value"]}
+
+        def _save(_e=None, vid=val["id"], var=name_var,
+                   from_return=False):
+            new_name = var.get().strip()
+            if not new_name:
+                # Reject empty — revert to last saved
+                var.set(current_name["value"])
+                return
+            if new_name == current_name["value"]:
+                # No-op — but if triggered by Enter, still deselect
+                # so user sees visual confirmation
+                if from_return:
+                    self.focus_set()
+                return
+            try:
+                db.update_tag_value(vid, new_name, val.get("color"))
+                self.changed = True
+                current_name["value"] = new_name
+                # Refresh ONLY the category list's summary count —
+                # don't destroy the Entry widget that owns focus.
+                self._refresh_cat_list()
+                # On Enter, drop focus to signal "saved." On FocusOut
+                # we're already losing focus naturally so no action.
+                if from_return:
+                    self.focus_set()
+            except Exception as e:
+                messagebox.showerror(
+                    "Rename failed",
+                    f"Could not rename value:\n\n{e}\n\n"
+                    f"Value names must be unique within a category.",
+                    parent=self)
+                # Revert on failure so UI reflects DB truth
+                var.set(current_name["value"])
+        entry.bind("<FocusOut>", _save)
+        entry.bind("<Return>",
+                     lambda e, s=_save: s(e, from_return=True))
+
+        # Delete
+        make_btn(row, "✕",
+                 lambda v=val: self._delete_value(v, cat_id),
+                 style="ghost", padx=8, pady=3).pack(side="right")
+
+    # ── Actions ───────────────────────────────────────────────────────────
+
+    def _new_category(self):
+        name = simpledialog.askstring(
+            "New Category",
+            "Category name (e.g. 'Reading Level'):",
+            parent=self)
+        if not name or not name.strip():
+            return
+        try:
+            cid = db.create_tag_category(self.class_id, name.strip(),
+                                           operation="ignore")
+            self.changed = True
+            self._refresh_cat_list()
+            self._select_category(cid)
+        except Exception as e:
+            messagebox.showerror(
+                "Create failed",
+                f"Could not create category:\n\n{e}\n\n"
+                f"Category names must be unique within a class.",
+                parent=self)
+
+    def _save_name(self, cat_id: int):
+        if not self._name_var:
+            return
+        new_name = self._name_var.get().strip()
+        cat = db.get_tag_category(cat_id)
+        if not cat or new_name == cat["name"] or not new_name:
+            return
+        try:
+            db.update_tag_category(cat_id, new_name, cat["operation"])
+            self.changed = True
+            self._refresh_cat_list()
+        except Exception as e:
+            messagebox.showerror(
+                "Rename failed",
+                f"Could not rename category:\n\n{e}",
+                parent=self)
+            # Revert the entry to the real stored value
+            self._name_var.set(cat["name"])
+
+    def _save_operation(self, cat_id: int):
+        if not self._op_var:
+            return
+        new_op = self._op_var.get()
+        cat = db.get_tag_category(cat_id)
+        if not cat or new_op == cat["operation"]:
+            return
+        try:
+            db.update_tag_category(cat_id, cat["name"], new_op)
+            self.changed = True
+            self._refresh_cat_list()
+        except Exception as e:
+            messagebox.showerror(
+                "Update failed",
+                f"Could not update operation:\n\n{e}",
+                parent=self)
+
+    def _delete_category(self, cat_id: int):
+        cat = db.get_tag_category(cat_id)
+        if not cat:
+            return
+        val_count = len(db.get_tag_values_for_category(cat_id))
+        confirm_msg = (
+            f"Delete category '{cat['name']}'?\n\n"
+            f"This will also remove {val_count} value"
+            f"{'s' if val_count != 1 else ''} "
+            f"and any student tag assignments under this category. "
+            f"Pair history and other rules are unaffected."
+        )
+        if not messagebox.askyesno("Delete category?", confirm_msg,
+                                     parent=self):
+            return
+        try:
+            db.delete_tag_category(cat_id)
+            self.changed = True
+            self._selected_cat_id = None
+            self._refresh_cat_list()
+            # Auto-select next category, or empty state
+            remaining = db.get_tag_categories_for_class(self.class_id)
+            if remaining:
+                self._select_category(remaining[0]["id"])
+            else:
+                self._render_empty_state()
+        except Exception as e:
+            messagebox.showerror(
+                "Delete failed",
+                f"Could not delete category:\n\n{e}",
+                parent=self)
+
+    def _new_value(self, cat_id: int):
+        name = simpledialog.askstring(
+            "New Value",
+            "Value name (e.g. 'advanced'):",
+            parent=self)
+        if not name or not name.strip():
+            return
+        # Default color — rotate through the palette based on how many
+        # values the category already has, so a fresh set of values
+        # gets visually distinct colors without the teacher needing
+        # to pick.
+        existing_count = len(db.get_tag_values_for_category(cat_id))
+        default_color = self.DEFAULT_COLORS[
+            existing_count % len(self.DEFAULT_COLORS)]
+        try:
+            db.create_tag_value(cat_id, name.strip(), color=default_color)
+            self.changed = True
+            self._refresh_cat_list()
+            self._render_detail(cat_id)
+        except Exception as e:
+            messagebox.showerror(
+                "Create failed",
+                f"Could not create value:\n\n{e}\n\n"
+                f"Value names must be unique within a category.",
+                parent=self)
+
+    def _delete_value(self, val: dict, cat_id: int):
+        confirm_msg = (
+            f"Delete value '{val['value']}'?\n\n"
+            f"Any students currently tagged with this value "
+            f"will have that tag cleared."
+        )
+        if not messagebox.askyesno("Delete value?", confirm_msg,
+                                     parent=self):
+            return
+        try:
+            db.delete_tag_value(val["id"])
+            self.changed = True
+            self._refresh_cat_list()
+            self._render_detail(cat_id)
+        except Exception as e:
+            messagebox.showerror(
+                "Delete failed",
+                f"Could not delete value:\n\n{e}",
+                parent=self)
+
+    def _pick_color(self, val: dict):
+        """Color picker dialog: swatch grid from DEFAULT_COLORS plus
+        an 'Other…' option for custom hex. Keeps the common path to
+        two clicks without forcing a system color dialog."""
+        picker = _ColorPickerDialog(self,
+                                      current=val.get("color"),
+                                      palette=self.DEFAULT_COLORS)
+        self.wait_window(picker)
+        if picker.result is None:
+            return
+        try:
+            db.update_tag_value(val["id"], val["value"], picker.result)
+            self.changed = True
+            cat_id = val.get("category_id") or self._selected_cat_id
+            if cat_id is not None:
+                self._render_detail(cat_id)
+        except Exception as e:
+            messagebox.showerror(
+                "Color update failed",
+                f"Could not update color:\n\n{e}",
+                parent=self)
+
+
+# ── Color Picker Dialog (Phase 4 tag system) ──────────────────────────────────
+
+class _ColorPickerDialog(tk.Toplevel):
+    """Lightweight color picker. Palette swatches + "Other…" for system
+    color chooser fallback + "Clear" to unset. Returns the chosen hex
+    string via self.result, or None if canceled.
+
+    Used by the Tag Rules dialog for picking value colors."""
+    def __init__(self, parent, current: str | None = None,
+                   palette: list | None = None):
+        super().__init__(parent)
+        self.result: str | None = None
+        self.current = current
+        self.palette = palette or []
+        self.title("Pick a color")
+        self.configure(bg=theme.BG)
+        self.resizable(False, False)
+        self.grab_set()
+        # Center on parent
+        self.transient(parent)
+        self._build()
+
+    def _build(self):
+        outer = tk.Frame(self, bg=theme.BG, padx=20, pady=16)
+        outer.pack()
+
+        tk.Label(outer, text="Choose color",
+                 font=theme.FONT_BOLD, bg=theme.BG,
+                 fg=theme.TEXT).pack(anchor="w", pady=(0, 10))
+
+        # Grid of swatches — 4 columns
+        grid = tk.Frame(outer, bg=theme.BG)
+        grid.pack()
+        COLS = 4
+        SIZE = 32
+        for i, color in enumerate(self.palette):
+            r, c = divmod(i, COLS)
+            is_current = (color == self.current)
+            cell = tk.Frame(grid, bg=color, width=SIZE, height=SIZE,
+                             highlightbackground=theme.ACCENT
+                                 if is_current else theme.TEXT_DIM,
+                             highlightthickness=2 if is_current else 1,
+                             cursor="hand2")
+            cell.grid(row=r, column=c, padx=4, pady=4)
+            cell.pack_propagate(False)
+            cell.bind("<Button-1>",
+                       lambda e, col=color: self._pick(col))
+
+        # Footer row: Custom / Clear / Cancel
+        footer = tk.Frame(outer, bg=theme.BG)
+        footer.pack(fill="x", pady=(12, 0))
+        make_btn(footer, "Other…", self._custom,
+                 style="ghost", padx=10, pady=5).pack(side="left")
+        if self.current:
+            make_btn(footer, "Clear", self._clear,
+                     style="ghost", padx=10, pady=5).pack(
+                         side="left", padx=(6, 0))
+        make_btn(footer, "Cancel", self.destroy,
+                 style="ghost", padx=10, pady=5).pack(side="right")
+
+    def _pick(self, color: str):
+        self.result = color
+        self.destroy()
+
+    def _custom(self):
+        """Pop the system color chooser for a custom hex."""
+        from tkinter import colorchooser
+        rgb, hexv = colorchooser.askcolor(
+            color=self.current or "#3b82f6",
+            parent=self,
+            title="Custom color")
+        if hexv:
+            self.result = hexv
+            self.destroy()
+
+    def _clear(self):
+        # Explicit "no color" — empty string distinct from "unchanged"
+        self.result = ""
+        self.destroy()
+
+
+# ── Stats Window ──────────────────────────────────────────────────────────────
+
+class _StatsPanel(tk.Frame):
+    """
+    Unified stats panel — replaces the old _StatsWindow Toplevel AND
+    the old _stats_tab content in v2.0. Sits inside the Stats tab.
+
+    Layout:
+      ┌─────────────────────────────────────────┐
+      │ Header: round counts                    │
+      │ Mode filter: All / Seating / Activities │
+      ├─────────────────────────────────────────┤
+      │ Sub-tabs: Overview │ Pairs │ Heatmap │  │
+      │           Per Student │ Tags           │
+      ├─────────────────────────────────────────┤
+      │  (selected sub-tab content)             │
+      └─────────────────────────────────────────┘
+
+    Mode filter applies across ALL sub-tabs uniformly. Tags sub-tab
+    hidden when class has no non-ignore categories.
+
+    Data is cached on init and re-derived lazily per sub-tab build to
+    keep mode switching responsive.
+    """
+    def __init__(self, parent, app, class_id: int, cls: dict):
+        super().__init__(parent, bg=theme.BG)
+        self.app      = app           # reference back to SeatingApp for shared helpers
+        self.class_id = class_id
+        self.cls      = cls
+
+        # Cached roster + name maps — same shape as the old _StatsWindow
         self.students = db.get_students_for_class(class_id, active_only=False)
         self.name_by_id = {s["id"]: (s.get("display") or s["name"])
                            for s in self.students}
         self.active_by_id = {s["id"]: s["active"] for s in self.students}
+
+        # Round availability informs which filter options are enabled
+        self.seating_rounds  = db.get_rounds_for_class(class_id)
+        self.activity_rounds = db.get_activity_rounds_for_class(class_id)
+        self.has_seating_history  = bool(self.seating_rounds)
+        self.has_activity_history = bool(self.activity_rounds)
+
+        # Default mode: combined view. If only one kind exists, lock
+        # the filter to that kind so the UI doesn't lie.
+        if self.has_seating_history and self.has_activity_history:
+            self.mode = "all"
+        elif self.has_seating_history:
+            self.mode = "seating"
+        elif self.has_activity_history:
+            self.mode = "activity"
+        else:
+            self.mode = "all"   # no rounds — empty state
+
+        # The active sub-tab key
+        self.subtab = "overview"
+
+        # Containers populated by _build()
+        self._mode_btns: dict = {}
+        self._subtab_btns: dict = {}
+        self._subtab_content: tk.Frame | None = None
+
+        # Cache of filtered pair history per mode. Invalidated when
+        # mode changes (since the underlying values change with mode).
+        self._stats_cache: dict = {}
+
+        # Per-student picker var lives at panel level so it survives
+        # sub-tab navigation. Same for the search query in pair history.
+        self._student_var: tk.StringVar | None = None
+        self._pair_search_query: str = ""
+
         self._build()
 
+    # ── Data helpers ──────────────────────────────────────────────────────
+
+    def _get_pair_history(self) -> dict:
+        """Resolve the pair-history dict for the active mode. Cached
+        per mode since it's expensive on large rosters."""
+        if self.mode in self._stats_cache:
+            return self._stats_cache[self.mode]
+        if self.mode == "seating":
+            data = db.get_pair_history(self.class_id)
+        elif self.mode == "activity":
+            data = db.get_activity_pair_history(self.class_id)
+        else:
+            # "all" — merge both sources. Independent of the class's
+            # pair_history_mode setting (which only governs optimizer
+            # input). This view is descriptive; teachers want to see
+            # everything by default.
+            from collections import defaultdict
+            seat = db.get_pair_history(self.class_id)
+            act  = db.get_activity_pair_history(self.class_id)
+            merged: dict = defaultdict(int)
+            for k, v in seat.items(): merged[k] += v
+            for k, v in act.items():  merged[k] += v
+            data = dict(merged)
+        self._stats_cache[self.mode] = data
+        return data
+
+    def _get_stats_for_mode(self) -> dict:
+        """Build a stats dict in the same shape as db.get_pair_stats but
+        filtered by the active mode. Reused by the Overview and
+        Heatmap sub-tabs.
+        """
+        history = self._get_pair_history()
+        n_students = len(self.students)
+        total_possible = n_students * (n_students - 1) // 2
+        unique_seen = len(history)
+        total_pairings = sum(history.values())
+        most_repeated = None
+        if history:
+            (a, b), cnt = max(history.items(), key=lambda kv: kv[1])
+            most_repeated = {
+                "name_a": self.name_by_id.get(a, f"#{a}"),
+                "name_b": self.name_by_id.get(b, f"#{b}"),
+                "count":  cnt}
+        # Total rounds count depends on mode for accuracy
+        if self.mode == "seating":
+            total_rounds = len(self.seating_rounds)
+        elif self.mode == "activity":
+            total_rounds = len(self.activity_rounds)
+        else:
+            total_rounds = len(self.seating_rounds) + len(self.activity_rounds)
+        return {
+            "pair_counts":         history,
+            "total_possible_pairs": total_possible,
+            "unique_pairs_seen":    unique_seen,
+            "total_pairings":       total_pairings,
+            "most_repeated":        most_repeated,
+            "total_rounds":         total_rounds,
+        }
+
+    def _get_latest_round_for_mode(self) -> tuple[str, dict] | None:
+        """Return the most recent round respecting the active mode.
+        Returns (round_type, round_dict) or None if no rounds for the
+        active filter."""
+        candidates: list = []
+        if self.mode in ("all", "seating") and self.seating_rounds:
+            candidates.append(("seating", self.seating_rounds[0]))
+        if self.mode in ("all", "activity") and self.activity_rounds:
+            candidates.append(("activity", self.activity_rounds[0]))
+        if not candidates:
+            return None
+        candidates.sort(key=lambda c: c[1].get("created_at") or "",
+                         reverse=True)
+        return candidates[0]
+
+    # ── Build ─────────────────────────────────────────────────────────────
+
     def _build(self):
-        tk.Label(self, text=f"Statistics for {self.cls['name']}",
-                 font=theme.FONT_TITLE, bg=theme.BG, fg=theme.TEXT,
-                 padx=24, pady=16).pack(anchor="w")
-        tk.Frame(self, bg=theme.SEP, height=1).pack(fill="x", padx=24)
+        # If there are NO rounds of any kind, show a minimal empty
+        # state instead of all the filter/sub-tab chrome.
+        if not self.has_seating_history and not self.has_activity_history:
+            top = tk.Frame(self, bg=theme.BG, pady=14, padx=28)
+            top.pack(fill="x")
+            section_label(top, "Stats").pack(anchor="w")
+            dim_label(top,
+                       "Class-level pairing and activity statistics "
+                       "will appear here.").pack(anchor="w", pady=(2, 0))
+            tk.Label(self,
+                     text="No rounds recorded yet. Generate a seating "
+                          "or activity round to start seeing stats.",
+                     font=theme.FONT_BODY, bg=theme.BG,
+                     fg=theme.TEXT_DIM, wraplength=500,
+                     justify="center").pack(pady=40, padx=40)
+            return
 
-        # Close button at bottom-fixed
-        bottom = tk.Frame(self, bg=theme.BG, padx=24, pady=12)
-        bottom.pack(side="bottom", fill="x")
-        make_btn(bottom, "Close", self.destroy,
-                 style="ghost", padx=16, pady=7).pack(side="right")
+        # Header row: title + round counts
+        top = tk.Frame(self, bg=theme.BG, pady=14, padx=28)
+        top.pack(fill="x")
+        section_label(top, "Stats").pack(anchor="w")
+        summary_parts = []
+        if self.has_seating_history:
+            n = len(self.seating_rounds)
+            summary_parts.append(
+                f"{n} seating round{'s' if n != 1 else ''}")
+        if self.has_activity_history:
+            n = len(self.activity_rounds)
+            summary_parts.append(
+                f"{n} activity round{'s' if n != 1 else ''}")
+        if summary_parts:
+            dim_label(top, "  ·  ".join(summary_parts)).pack(
+                anchor="w", pady=(2, 0))
 
-        # Use a Text widget as the outer scroll container — native trackpad
-        # scroll with freely-embedded widgets.
-        body_container, body_text = make_text_scroll_container(
-            self, padx=24, pady=12)
-        body_container.pack(fill="both", expand=True)
+        # Mode filter — only when both round types exist (otherwise
+        # the choice is forced and showing the filter would be
+        # confusing)
+        if self.has_seating_history and self.has_activity_history:
+            filter_row = tk.Frame(self, bg=theme.BG, padx=28)
+            filter_row.pack(fill="x", pady=(8, 4))
+            tk.Label(filter_row, text="Showing:",
+                     font=theme.FONT_SMALL, bg=theme.BG,
+                     fg=theme.TEXT_DIM).pack(side="left", padx=(0, 8))
+            for label, key in [("All", "all"),
+                                ("Seating only", "seating"),
+                                ("Activities only", "activity")]:
+                b = make_btn(filter_row, f"  {label}  ",
+                             command=lambda k=key: self._set_mode(k),
+                             style="tab", padx=12, pady=4)
+                b.pack(side="left", padx=(0, 6))
+                self._mode_btns[key] = b
+            self._highlight_mode_btns()
+
+        # Sub-tab bar
+        subtab_bar = tk.Frame(self, bg=theme.BG, padx=28)
+        subtab_bar.pack(fill="x", pady=(8, 0))
+        sub_tabs = [("Overview",    "overview"),
+                     ("Pair History", "pairs"),
+                     ("Heatmap",     "heatmap"),
+                     ("Per Student", "per_student")]
+        if db.class_has_tags(self.class_id):
+            sub_tabs.append(("Tags", "tags"))
+        for label, key in sub_tabs:
+            b = make_btn(subtab_bar, f"  {label}  ",
+                         command=lambda k=key: self._set_subtab(k),
+                         style="tab", padx=14, pady=6)
+            b.pack(side="left", padx=(0, 4))
+            self._subtab_btns[key] = b
+        self._highlight_subtab_btns()
+
+        tk.Frame(self, bg=theme.SEP, height=1).pack(
+            fill="x", padx=28, pady=(8, 0))
+
+        # Content area for the active sub-tab. Rebuilt on every
+        # mode/subtab change.
+        self._subtab_content = tk.Frame(self, bg=theme.BG)
+        self._subtab_content.pack(fill="both", expand=True)
+        self._render_subtab()
+
+    def _highlight_mode_btns(self):
+        for k, b in self._mode_btns.items():
+            active = (k == self.mode)
+            b.configure(bg=theme.ACCENT if active else theme.BG,
+                        fg=theme.ACCENT_TEXT if active else theme.TEXT_DIM)
+            b._btn_bg    = theme.ACCENT if active else theme.BG
+            b._btn_hover = theme.ACCENT_DARK if active else theme.SEP
+
+    def _highlight_subtab_btns(self):
+        for k, b in self._subtab_btns.items():
+            active = (k == self.subtab)
+            b.configure(bg=theme.ACCENT if active else theme.BG,
+                        fg=theme.ACCENT_TEXT if active else theme.TEXT_DIM)
+            b._btn_bg    = theme.ACCENT if active else theme.BG
+            b._btn_hover = theme.ACCENT_DARK if active else theme.SEP
+
+    def _set_mode(self, mode: str):
+        if mode == self.mode:
+            return
+        self.mode = mode
+        # Mode change invalidates the pair-history cache for THIS mode
+        # only — other modes' cached values remain valid. Clearing the
+        # whole cache is simpler and not expensive.
+        self._stats_cache.clear()
+        self._highlight_mode_btns()
+        self._render_subtab()
+
+    def _set_subtab(self, key: str):
+        if key == self.subtab:
+            return
+        self.subtab = key
+        self._highlight_subtab_btns()
+        self._render_subtab()
+
+    def _render_subtab(self):
+        """Destroy and rebuild the content area for the active sub-tab."""
+        if not self._subtab_content or not self._subtab_content.winfo_exists():
+            return
+        for w in self._subtab_content.winfo_children():
+            w.destroy()
+        method = {
+            "overview":    self._render_overview,
+            "pairs":       self._render_pairs,
+            "heatmap":     self._render_heatmap,
+            "per_student": self._render_per_student,
+            "tags":        self._render_tags,
+        }.get(self.subtab)
+        if method:
+            method(self._subtab_content)
+        # macOS Tk needs a paint nudge after dynamic rebuilds
+        try:
+            self.app._force_paint()
+        except Exception:
+            pass
+
+    # ── Overview sub-tab ───────────────────────────────────────────────────
+
+    def _render_overview(self, parent):
+        """Headline metrics + student-activity heatmap (when applicable).
+        Filtered by the active mode."""
+        # Scroll container so very long overview content still works
+        scroll_container, body = make_text_scroll_container(
+            parent, padx=24, pady=12)
+        scroll_container.pack(fill="both", expand=True)
+        body.bind("<Key>", lambda e: "break")
+        body.bind("<Button-2>", lambda e: "break")
 
         def add_block(w, pady_after=0):
-            body_text.window_create("end", window=w, stretch=1)
-            body_text.insert("end", "\n")
+            body.window_create("end", window=w, stretch=1)
+            body.insert("end", "\n")
             if pady_after:
-                sp = tk.Frame(body_text, bg=theme.BG, height=pady_after)
-                body_text.window_create("end", window=sp)
-                body_text.insert("end", "\n")
+                sp = tk.Frame(body, bg=theme.BG, height=pady_after)
+                body.window_create("end", window=sp)
+                body.insert("end", "\n")
 
-        # Block text editing but keep scroll
-        body_text.bind("<Key>", lambda e: "break")
-        body_text.bind("<Button-2>", lambda e: "break")
+        # Metrics card
+        add_block(self._build_metrics_section(body), pady_after=16)
 
-        # ── L1: Headline metrics ─────────────────────────────────────────
-        l1 = self._build_metrics_section(body_text)
-        add_block(l1, pady_after=16)
+        # Student-Activity heatmap (only relevant when activities exist
+        # AND the mode includes activity rounds)
+        if (db.class_has_activities(self.class_id)
+                and self.mode in ("all", "activity")
+                and self.has_activity_history):
+            sa_history = db.get_student_activity_history(self.class_id)
+            if sa_history:
+                activities = db.get_activities_for_class(
+                    self.class_id, include_archived=True)
+                sa_frame = tk.Frame(body, bg=theme.PANEL,
+                                     highlightbackground=theme.BORDER,
+                                     highlightthickness=1)
+                sa_inner = tk.Frame(sa_frame, bg=theme.PANEL,
+                                     padx=18, pady=14)
+                sa_inner.pack(fill="x")
+                tk.Label(sa_inner, text="Student-Activity History",
+                         font=theme.FONT_BOLD, bg=theme.PANEL,
+                         fg=theme.TEXT).pack(anchor="w")
+                tk.Label(sa_inner,
+                         text="How many times each student has been "
+                              "assigned to each activity.",
+                         font=theme.FONT_SMALL, bg=theme.PANEL,
+                         fg=theme.TEXT_DIM).pack(anchor="w",
+                                                 pady=(2, 8))
+                # Delegate to the existing renderer on SeatingApp,
+                # passing all the args it expects
+                self.app._render_student_activity_heatmap(
+                    sa_inner, self.students, activities, sa_history,
+                    self.name_by_id)
+                add_block(sa_frame, pady_after=8)
 
-        # ── L2: Per-student pairings ─────────────────────────────────────
-        l2 = self._build_student_section(body_text)
-        add_block(l2, pady_after=16)
+    # ── Pair History sub-tab ───────────────────────────────────────────────
 
-        # ── L3: Heat map ─────────────────────────────────────────────────
-        l3 = self._build_heatmap_section(body_text)
-        add_block(l3, pady_after=8)
+    def _render_pairs(self, parent):
+        history = self._get_pair_history()
+        wrapper = tk.Frame(parent, bg=theme.BG, padx=28, pady=14)
+        wrapper.pack(fill="both", expand=True)
+        header_row = tk.Frame(wrapper, bg=theme.BG)
+        header_row.pack(fill="x")
+        section_label(header_row, "Pair History").pack(
+            side="left", anchor="w")
+        mode_desc = {"all":      "All rounds",
+                      "seating":  "Seating rounds only",
+                      "activity": "Activity rounds only"}
+        dim_label(header_row,
+                   f"  ·  {mode_desc.get(self.mode, '')}"
+                  ).pack(side="left", anchor="w", padx=(4, 0))
+        dim_label(wrapper,
+                   "Times each pair of students has shared a "
+                   "group (table or activity)."
+                  ).pack(anchor="w")
+
+        if not history:
+            tk.Label(wrapper,
+                     text="No pair history in this view.",
+                     font=theme.FONT_BODY, bg=theme.BG,
+                     fg=theme.TEXT_DIM).pack(pady=20)
+            return
+
+        pairs = sorted(
+            [((self.name_by_id.get(a, f"#{a}"),
+                self.name_by_id.get(b, f"#{b}")), c)
+             for (a, b), c in history.items()],
+            key=lambda x: -x[1])
+
+        # Search row
+        search_row = tk.Frame(wrapper, bg=theme.BG)
+        search_row.pack(fill="x", pady=(8, 4))
+        tk.Label(search_row, text="🔍", font=theme.FONT_BODY,
+                 bg=theme.BG, fg=theme.TEXT_DIM).pack(
+                     side="left", padx=(0, 6))
+        search_var = tk.StringVar(value=self._pair_search_query)
+        styled_entry(search_row, textvariable=search_var).pack(
+            side="left", fill="x", expand=True)
+        count_lbl = tk.Label(search_row, text="",
+                              font=theme.FONT_SMALL, bg=theme.BG,
+                              fg=theme.TEXT_MUTED)
+        count_lbl.pack(side="right", padx=(8, 0))
+        dim_label(wrapper,
+                   "    Search matches either student in the pair."
+                  ).pack(anchor="w")
+
+        tree = ttk.Treeview(wrapper, columns=("pair", "count"),
+                             show="headings", height=14)
+        tree.heading("pair",  text="Student Pair")
+        tree.heading("count", text="Times Together")
+        tree.column("pair",  width=420, anchor="w")
+        tree.column("count", width=140, anchor="center")
+        tree.pack(fill="both", expand=True, pady=8)
+
+        def _refresh_tree(*_):
+            q = search_var.get().strip().lower()
+            self._pair_search_query = search_var.get()
+            for row in tree.get_children():
+                tree.delete(row)
+            shown = 0
+            for (names, count) in pairs:
+                if q and q not in names[0].lower() and q not in names[1].lower():
+                    continue
+                tree.insert("", "end",
+                             values=(f"{names[0]}  &  {names[1]}",
+                                     count))
+                shown += 1
+            if q:
+                count_lbl.configure(
+                    text=f"{shown} of {len(pairs)} matching")
+            else:
+                count_lbl.configure(text=f"{len(pairs)} pairs")
+
+        search_var.trace_add("write", _refresh_tree)
+        _refresh_tree()
+
+    # ── Heatmap sub-tab ────────────────────────────────────────────────────
+
+    def _render_heatmap(self, parent):
+        scroll_container, body = make_text_scroll_container(
+            parent, padx=24, pady=12)
+        scroll_container.pack(fill="both", expand=True)
+        body.bind("<Key>", lambda e: "break")
+        body.bind("<Button-2>", lambda e: "break")
+
+        hm = self._build_heatmap_section(body)
+        body.window_create("end", window=hm, stretch=1)
+        body.insert("end", "\n")
+
+    # ── Per Student sub-tab ───────────────────────────────────────────────
+
+    def _render_per_student(self, parent):
+        scroll_container, body = make_text_scroll_container(
+            parent, padx=24, pady=12)
+        scroll_container.pack(fill="both", expand=True)
+        body.bind("<Key>", lambda e: "break")
+        body.bind("<Button-2>", lambda e: "break")
+
+        ps = self._build_student_section(body)
+        body.window_create("end", window=ps, stretch=1)
+        body.insert("end", "\n")
+
+    # ── Tags sub-tab ───────────────────────────────────────────────────────
+
+    def _render_tags(self, parent):
+        scroll_container, body = make_text_scroll_container(
+            parent, padx=24, pady=12)
+        scroll_container.pack(fill="both", expand=True)
+        body.bind("<Key>", lambda e: "break")
+        body.bind("<Button-2>", lambda e: "break")
+
+        tg = self._build_tags_section(body)
+        if tg is not None:
+            body.window_create("end", window=tg, stretch=1)
+            body.insert("end", "\n")
+        else:
+            tk.Label(body, text="No tag rules to summarize "
+                              "(all categories are set to 'ignore').",
+                     font=theme.FONT_SMALL, bg=theme.BG,
+                     fg=theme.TEXT_DIM).pack(padx=24, pady=12)
 
     # ── L1 ────────────────────────────────────────────────────────────────
 
     def _build_metrics_section(self, parent):
+        # Read stats fresh for the active mode each build
+        stats = self._get_stats_for_mode()
         frame = tk.Frame(parent, bg=theme.PANEL,
                           highlightbackground=theme.BORDER, highlightthickness=1)
         inner = tk.Frame(frame, bg=theme.PANEL, padx=18, pady=14)
@@ -6330,11 +9796,10 @@ class _StatsWindow(tk.Toplevel):
         tk.Label(inner, text="Pairing Coverage", font=theme.FONT_BOLD,
                  bg=theme.PANEL, fg=theme.TEXT).pack(anchor="w")
 
-        total  = self.stats["total_possible_pairs"]
-        unique = self.stats["unique_pairs_seen"]
+        total  = stats["total_possible_pairs"]
+        unique = stats["unique_pairs_seen"]
         pct    = (unique / total * 100) if total else 0
 
-        # Big coverage number
         if total == 0:
             status = "Not enough students."
         elif unique == total:
@@ -6344,12 +9809,11 @@ class _StatsWindow(tk.Toplevel):
         tk.Label(inner, text=status, font=theme.FONT_BODY,
                  bg=theme.PANEL, fg=theme.TEXT).pack(anchor="w", pady=(6, 2))
 
-        # Secondary details
         details = []
-        details.append(f"Total rounds generated: {self.stats['total_rounds']}")
-        details.append(f"Total pair-sharing events: {self.stats['total_pairings']}")
+        details.append(f"Total rounds in this view: {stats['total_rounds']}")
+        details.append(f"Total pair-sharing events: {stats['total_pairings']}")
 
-        mr = self.stats["most_repeated"]
+        mr = stats["most_repeated"]
         if mr:
             if mr["count"] == 1:
                 details.append("Most repeated: no pair has sat together more than once yet")
@@ -6360,96 +9824,130 @@ class _StatsWindow(tk.Toplevel):
             tk.Label(inner, text=d, font=theme.FONT_SMALL,
                      bg=theme.PANEL, fg=theme.TEXT_DIM).pack(anchor="w")
 
-        # Momentum (replaces the old "projection" — we don't predict any more,
-        # we describe what's happening)
-        projection = self._compute_projection()
+        # Rotation momentum — now mode-aware (uses seating, activity,
+        # or combined new-pair counters depending on self.mode).
+        projection = self._compute_projection(stats)
         if projection:
-            tk.Frame(inner, bg=theme.SEP, height=1).pack(fill="x", pady=(10, 8))
-            tk.Label(inner, text="Rotation momentum", font=theme.FONT_BOLD,
-                     bg=theme.PANEL, fg=theme.TEXT).pack(anchor="w")
+            tk.Frame(inner, bg=theme.SEP, height=1).pack(
+                fill="x", pady=(10, 8))
+            tk.Label(inner, text="Rotation momentum",
+                     font=theme.FONT_BOLD, bg=theme.PANEL,
+                     fg=theme.TEXT).pack(anchor="w")
             for line in projection:
                 tk.Label(inner, text=line, font=theme.FONT_SMALL,
-                         bg=theme.PANEL, fg=theme.TEXT_DIM).pack(anchor="w")
+                         bg=theme.PANEL, fg=theme.TEXT_DIM).pack(
+                             anchor="w")
 
         return frame
 
-    def _compute_projection(self) -> list:
-        """
-        Returns a list of human-readable status lines about rotation progress.
+    def _compute_projection(self, stats: dict) -> list:
+        """Descriptive momentum metric lines, mode-aware.
 
-        The old implementation reported "N more rounds to full coverage"
-        using a theoretical upper bound — but 100% coverage is rarely
-        actually reachable in practice (attendance, constraints, optimizer
-        tradeoffs), which made the metric feel like a perpetually-unmet
-        goal. We replaced it with a descriptive momentum metric + a
-        saturation descriptor that reframes high coverage + 0-new-pairings
-        as the success state it is ("done", not "stuck").
+        For each mode, "rounds" means the timeline of rounds of that
+        type (or merged for 'all') and "new pairings" means pairs that
+        had never appeared in any prior round of the same scope.
+
+        - seating  → seating rounds + count_new_pairs_in_round
+        - activity → activity rounds + count_new_activity_pairs_in_round
+        - all      → merged timeline + count_new_pairs_in_round_combined
+                     (a pair counts as "new" only if it had never
+                      shared a table OR activity in any prior round)
         """
-        total  = self.stats["total_possible_pairs"]
-        unique = self.stats["unique_pairs_seen"]
+        total  = stats["total_possible_pairs"]
+        unique = stats["unique_pairs_seen"]
         if total == 0 or unique == 0:
             return []
 
-        rounds_for_class = db.get_rounds_for_class(self.class_id)
-        if not rounds_for_class:
+        # Build (round_id, round_type, label) timeline for the active mode,
+        # newest first. For "all" we interleave by created_at descending.
+        if self.mode == "seating":
+            timeline = [(r["id"], "seating", "seating round",
+                          r.get("created_at") or "")
+                         for r in self.seating_rounds]
+        elif self.mode == "activity":
+            timeline = [(r["id"], "activity", "activity round",
+                          r.get("created_at") or "")
+                         for r in self.activity_rounds]
+        else:
+            combined = []
+            for r in self.seating_rounds:
+                combined.append((r["id"], "seating", "seating round",
+                                  r.get("created_at") or ""))
+            for r in self.activity_rounds:
+                combined.append((r["id"], "activity", "activity round",
+                                  r.get("created_at") or ""))
+            # Newest first
+            combined.sort(key=lambda c: c[3], reverse=True)
+            timeline = combined
+
+        if not timeline:
             return []
+
+        def count_new(round_id: int, round_type: str) -> int | None:
+            """Dispatch to the right DB counter based on mode + round type."""
+            try:
+                if self.mode == "seating":
+                    return db.count_new_pairs_in_round(self.class_id, round_id)
+                elif self.mode == "activity":
+                    return db.count_new_activity_pairs_in_round(
+                        self.class_id, round_id)
+                else:
+                    return db.count_new_pairs_in_round_combined(
+                        self.class_id, round_id, round_type)
+            except Exception:
+                return None
 
         lines = []
         pct = (unique / total * 100)
-        # Mirror the class detail helper so thresholds stay in one place.
-        # Reach into the owning app instance for the classmethod; if it
-        # isn't present for some reason, degrade gracefully.
         descriptor = None
         try:
-            descriptor = self.master._saturation_descriptor(pct)
+            descriptor = self.app._saturation_descriptor(pct)
         except Exception:
             descriptor = None
 
-        # New pairings in the most recent round
-        last_rid = rounds_for_class[0]["id"]
-        try:
-            last_new = db.count_new_pairs_in_round(self.class_id, last_rid)
-        except Exception:
-            last_new = None
+        # Most recent round in this mode's timeline
+        last_id, last_type, last_label, _ = timeline[0]
+        last_new = count_new(last_id, last_type)
 
         if last_new is not None:
             prefix = f"{descriptor}. " if descriptor else ""
+            # Label the most recent round by type so "all" mode doesn't
+            # ambiguously say "last round" — say "last seating round" or
+            # "last activity round" so the teacher knows what they're
+            # looking at.
+            round_label = (f"last {last_label}" if self.mode == "all"
+                            else "your last round")
             if last_new == 0:
-                # At high saturation, "0 new" is the natural end-state, not
-                # a stall. The descriptor carries the tone.
                 if pct >= 90:
                     lines.append(
-                        f"• {prefix}0 new pairings in your last round — most "
+                        f"• {prefix}0 new pairings in {round_label} — most "
                         f"connections have already formed.")
                 else:
-                    # Low coverage + 0 new = actual stall. Say so gently but
-                    # honestly so the teacher knows to check constraints /
-                    # attendance.
                     lines.append(
-                        f"• {prefix}0 new pairings in your last round. This "
+                        f"• {prefix}0 new pairings in {round_label}. This "
                         f"can happen if the same students are absent each "
                         f"round or if constraints are tight.")
             else:
                 plural = "s" if last_new != 1 else ""
                 lines.append(
-                    f"• {prefix}{last_new} new pairing{plural} added in your "
-                    f"last round.")
+                    f"• {prefix}{last_new} new pairing{plural} added in "
+                    f"{round_label}.")
 
-        # Recent trend: average new pairings over the last 3 rounds
-        recent_ids = [r["id"] for r in rounds_for_class[:3]]
-        if len(recent_ids) >= 2:
-            try:
-                recent_counts = [db.count_new_pairs_in_round(self.class_id, rid)
-                                   for rid in recent_ids]
+        # Recent trend across the last 3 rounds in this mode's timeline
+        recent = timeline[:3]
+        if len(recent) >= 2:
+            recent_counts = []
+            for rid, rtype, _, _ in recent:
+                c = count_new(rid, rtype)
+                if c is not None:
+                    recent_counts.append(c)
+            if recent_counts and sum(recent_counts) > 0:
                 avg_recent = sum(recent_counts) / len(recent_counts)
-                if avg_recent > 0:
-                    lines.append(
-                        f"• Averaging {avg_recent:.1f} new pairings per round "
-                        f"across your last {len(recent_counts)} rounds.")
-            except Exception:
-                pass
+                round_word = ("round" if self.mode != "all" else "round (any type)")
+                lines.append(
+                    f"• Averaging {avg_recent:.1f} new pairings per "
+                    f"{round_word} across your last {len(recent_counts)}.")
 
-        # Coverage context — framed as success states, not deficits
         if pct >= 96:
             lines.append(
                 "• At this level of saturation, remaining pairings are the "
@@ -6459,10 +9957,9 @@ class _StatsWindow(tk.Toplevel):
             lines.append(
                 "• Most students have sat with most of their classmates "
                 "at least once.")
-
         return lines
 
-    # ── L2 ────────────────────────────────────────────────────────────────
+    # ── L2: Per-Student ──────────────────────────────────────────────────
 
     def _build_student_section(self, parent):
         frame = tk.Frame(parent, bg=theme.PANEL,
@@ -6472,29 +9969,39 @@ class _StatsWindow(tk.Toplevel):
 
         tk.Label(inner, text="Per-Student Pairings", font=theme.FONT_BOLD,
                  bg=theme.PANEL, fg=theme.TEXT).pack(anchor="w")
-        tk.Label(inner, text="Select a student to see who they have and haven't sat with.",
+        mode_desc = {"all":      "Combined across all rounds",
+                      "seating":  "Seating rounds only",
+                      "activity": "Activity rounds only"}
+        tk.Label(inner,
+                 text=("Select a student to see who they have and haven't "
+                       f"sat with.  ·  {mode_desc.get(self.mode, '')}"),
                  font=theme.FONT_SMALL, bg=theme.PANEL,
                  fg=theme.TEXT_DIM).pack(anchor="w", pady=(2, 8))
 
-        # Picker row
         picker_row = tk.Frame(inner, bg=theme.PANEL)
         picker_row.pack(fill="x")
         tk.Label(picker_row, text="Student:", font=theme.FONT_SMALL,
                  bg=theme.PANEL, fg=theme.TEXT).pack(side="left", padx=(0, 8))
         student_names = [s.get("display") or s["name"] for s in self.students]
-        self._student_var = tk.StringVar()
+        # Preserve selection across mode changes if possible
+        prior = self._student_var.get() if self._student_var else ""
+        self._student_var = tk.StringVar(
+            value=prior if prior in student_names else "")
         picker = ttk.Combobox(picker_row, textvariable=self._student_var,
                                values=student_names, state="readonly", width=30)
         picker.pack(side="left")
         picker.bind("<<ComboboxSelected>>", self._on_student_selected)
 
-        # Results area (populated on selection)
         self._student_results = tk.Frame(inner, bg=theme.PANEL)
         self._student_results.pack(fill="both", expand=True, pady=(12, 0))
-        tk.Label(self._student_results,
-                 text="(pick a student above)",
-                 font=theme.FONT_SMALL, bg=theme.PANEL,
-                 fg=theme.TEXT_MUTED).pack(anchor="w")
+        if prior in student_names:
+            # Auto-render the previously selected student under the new mode
+            self._on_student_selected()
+        else:
+            tk.Label(self._student_results,
+                     text="(pick a student above)",
+                     font=theme.FONT_SMALL, bg=theme.PANEL,
+                     fg=theme.TEXT_MUTED).pack(anchor="w")
 
         return frame
 
@@ -6504,59 +10011,80 @@ class _StatsWindow(tk.Toplevel):
                           if (s.get("display") or s["name"]) == name), None)
         if not student:
             return
-        data = db.get_student_pairings(self.class_id, student["id"])
+        # Build paired / never-paired from the filtered pair history
+        history = self._get_pair_history()
+        sid = student["id"]
+        # Pair counts involving this student
+        paired_map: dict = {}
+        for (a, b), c in history.items():
+            if a == sid:
+                paired_map[b] = c
+            elif b == sid:
+                paired_map[a] = c
+        paired = sorted(
+            [{"id": pid, "name": self.name_by_id.get(pid, f"#{pid}"),
+              "count": cnt}
+             for pid, cnt in paired_map.items()],
+            key=lambda p: (-p["count"], p["name"].lower()))
+        never_paired_ids = [
+            s["id"] for s in self.students
+            if s["id"] != sid and s["id"] not in paired_map]
+        never_paired = sorted(
+            [{"id": pid, "name": self.name_by_id.get(pid, f"#{pid}")}
+             for pid in never_paired_ids],
+            key=lambda p: p["name"].lower())
 
-        # Clear previous results
+        # Clear and rebuild
         for w in self._student_results.winfo_children():
             w.destroy()
 
-        # Two-column layout: paired on left, never paired on right
         cols = tk.Frame(self._student_results, bg=theme.PANEL)
         cols.pack(fill="both", expand=True)
         cols.columnconfigure(0, weight=1, uniform="cols")
         cols.columnconfigure(1, weight=1, uniform="cols")
 
-        # Left: paired, grouped by count
         paired_col = tk.Frame(cols, bg=theme.PANEL)
         paired_col.grid(row=0, column=0, sticky="nsew", padx=(0, 10))
         tk.Label(paired_col,
-                 text=f"Has sat with ({len(data['paired'])})",
-                 font=theme.FONT_BOLD, bg=theme.PANEL, fg=theme.TEXT).pack(anchor="w")
-        if not data["paired"]:
+                 text=f"Has sat with ({len(paired)})",
+                 font=theme.FONT_BOLD, bg=theme.PANEL,
+                 fg=theme.TEXT).pack(anchor="w")
+        if not paired:
             tk.Label(paired_col, text="(nobody yet)",
                      font=theme.FONT_SMALL, bg=theme.PANEL,
                      fg=theme.TEXT_MUTED).pack(anchor="w", pady=(4, 0))
         else:
-            # Group by count (highest first)
             from collections import defaultdict
             groups: dict = defaultdict(list)
-            for p in data["paired"]:
+            for p in paired:
                 groups[p["count"]].append(p)
             for cnt in sorted(groups.keys(), reverse=True):
                 tk.Label(paired_col,
                          text=f"  {cnt}× together:",
                          font=theme.FONT_SMALL, bg=theme.PANEL,
-                         fg=theme.TEXT_DIM).pack(anchor="w", pady=(6, 2))
+                         fg=theme.TEXT_DIM).pack(
+                             anchor="w", pady=(6, 2))
                 for p in groups[cnt]:
                     dim = not self.active_by_id.get(p["id"], True)
                     fg  = theme.TEXT_MUTED if dim else theme.TEXT
                     suffix = "  (inactive)" if dim else ""
-                    tk.Label(paired_col, text=f"      • {p['name']}{suffix}",
+                    tk.Label(paired_col,
+                             text=f"      • {p['name']}{suffix}",
                              font=theme.FONT_BODY, bg=theme.PANEL,
                              fg=fg).pack(anchor="w")
 
-        # Right: never paired
         never_col = tk.Frame(cols, bg=theme.PANEL)
         never_col.grid(row=0, column=1, sticky="nsew", padx=(10, 0))
         tk.Label(never_col,
-                 text=f"Has NOT sat with ({len(data['never_paired'])})",
-                 font=theme.FONT_BOLD, bg=theme.PANEL, fg=theme.TEXT).pack(anchor="w")
-        if not data["never_paired"]:
+                 text=f"Has NOT sat with ({len(never_paired)})",
+                 font=theme.FONT_BOLD, bg=theme.PANEL,
+                 fg=theme.TEXT).pack(anchor="w")
+        if not never_paired:
             tk.Label(never_col, text="(sat with everyone!)",
                      font=theme.FONT_SMALL, bg=theme.PANEL,
                      fg=theme.SUCCESS).pack(anchor="w", pady=(4, 0))
         else:
-            for p in data["never_paired"]:
+            for p in never_paired:
                 dim = not self.active_by_id.get(p["id"], True)
                 fg  = theme.TEXT_MUTED if dim else theme.TEXT
                 suffix = "  (inactive)" if dim else ""
@@ -6567,6 +10095,11 @@ class _StatsWindow(tk.Toplevel):
     # ── L3: Heat Map ──────────────────────────────────────────────────────
 
     def _build_heatmap_section(self, parent):
+        history = self._get_pair_history()
+        # Build stats dict in the shape the old heatmap renderer
+        # expected (it reads stats["pair_counts"]).
+        stats = {"pair_counts": history}
+
         frame = tk.Frame(parent, bg=theme.PANEL,
                           highlightbackground=theme.BORDER, highlightthickness=1)
         inner = tk.Frame(frame, bg=theme.PANEL, padx=18, pady=14)
@@ -6574,13 +10107,16 @@ class _StatsWindow(tk.Toplevel):
 
         tk.Label(inner, text="Pairing Heat Map", font=theme.FONT_BOLD,
                  bg=theme.PANEL, fg=theme.TEXT).pack(anchor="w")
+        mode_desc = {"all":      "All rounds",
+                      "seating":  "Seating rounds only",
+                      "activity": "Activity rounds only"}
         tk.Label(inner,
-                 text="Each cell shows how many times a pair has sat together. "
-                      "Click a cell to see the rounds they shared.",
+                 text=(f"Each cell shows how many times a pair has sat "
+                       f"together ({mode_desc.get(self.mode, '')}). "
+                       f"Click a cell to see the rounds they shared."),
                  font=theme.FONT_SMALL, bg=theme.PANEL,
                  fg=theme.TEXT_DIM).pack(anchor="w", pady=(2, 10))
 
-        # Sort students alphabetically for deterministic grid
         sorted_students = sorted(
             self.students,
             key=lambda s: (s.get("display") or s["name"]).lower())
@@ -6591,15 +10127,10 @@ class _StatsWindow(tk.Toplevel):
                      fg=theme.TEXT_MUTED).pack(anchor="w")
             return frame
 
-        # Cell size adapts to class size so huge classes still fit
         cell = 28 if N <= 20 else (22 if N <= 30 else 18)
-        # Reserve horizontal space for row labels based on longest display
         max_name_len = max(len(s.get("display") or s["name"])
                            for s in sorted_students)
         label_w = max(60, min(140, 8 * max_name_len))
-        # Reserve vertical space for rotated column labels. At 45° rotation,
-        # the text extent vertically is roughly the text's horizontal length
-        # times sin(45°) ≈ 0.71, plus padding. Cap truncated names at 12 chars.
         import math as _math
         max_col_chars = min(12, max_name_len)
         label_h = int(max_col_chars * 8 * _math.sin(_math.radians(45))) + 16
@@ -6611,16 +10142,12 @@ class _StatsWindow(tk.Toplevel):
                             height=canvas_h, highlightthickness=0)
         canvas.pack()
 
-        # Find max pair count to scale colors
-        max_count = max(self.stats["pair_counts"].values(), default=0)
+        max_count = max(stats["pair_counts"].values(), default=0)
 
         def color_for(count: int) -> str:
-            """Return a hex color for a pair count from 0 to max_count."""
             if count == 0 or max_count == 0:
                 return theme.BG
-            # Interpolate from PANEL (bg) to ACCENT
             t = min(1.0, count / max_count)
-            # Parse accent and panel as hex
             def hex_to_rgb(h):
                 h = h.lstrip("#")
                 return (int(h[0:2], 16), int(h[2:4], 16), int(h[4:6], 16))
@@ -6631,13 +10158,7 @@ class _StatsWindow(tk.Toplevel):
             b = int(bg[2] + (fg[2] - bg[2]) * t)
             return f"#{r:02x}{g:02x}{b:02x}"
 
-        # Draw column labels — rotated 45° with SW anchor so the text's
-        # bottom-left sits right above each column's center. The text then
-        # extends up and to the right, fitting neatly into the triangle of
-        # space above the grid.
         for j, s in enumerate(sorted_students):
-            # Anchor point: above the column, slightly left of center so
-            # rotated text visually centers on the column
             x = label_w + j * cell + cell // 2 - 4
             y = label_h - 4
             active = s["active"]
@@ -6647,7 +10168,6 @@ class _StatsWindow(tk.Toplevel):
             canvas.create_text(x, y, text=txt, angle=45, anchor="sw",
                                 font=theme.FONT_SMALL, fill=fg)
 
-        # Draw row labels
         for i, s in enumerate(sorted_students):
             y = label_h + i * cell + cell // 2
             active = s["active"]
@@ -6657,8 +10177,7 @@ class _StatsWindow(tk.Toplevel):
             canvas.create_text(label_w - 4, y, text=txt, anchor="e",
                                 font=theme.FONT_SMALL, fill=fg)
 
-        # Draw cells
-        pair_counts = self.stats["pair_counts"]
+        pair_counts = stats["pair_counts"]
         for i, s_i in enumerate(sorted_students):
             for j, s_j in enumerate(sorted_students):
                 x1 = label_w + j * cell
@@ -6666,7 +10185,6 @@ class _StatsWindow(tk.Toplevel):
                 x2 = x1 + cell
                 y2 = y1 + cell
                 if i == j:
-                    # Diagonal — can't pair with yourself
                     canvas.create_rectangle(x1, y1, x2, y2,
                                              fill=theme.SEP, outline=theme.PANEL)
                     continue
@@ -6676,23 +10194,20 @@ class _StatsWindow(tk.Toplevel):
                 rect  = canvas.create_rectangle(x1, y1, x2, y2,
                                                  fill=fill, outline=theme.PANEL,
                                                  tags=(f"cell_{a}_{b}",))
-                # Show count number if >= 2 (otherwise the color carries it)
                 if count >= 2:
-                    # Choose text color based on cell brightness
                     tc = theme.ACCENT_TEXT if count / max(max_count, 1) > 0.5 else theme.TEXT
                     canvas.create_text((x1 + x2) / 2, (y1 + y2) / 2,
                                         text=str(count), font=theme.FONT_SMALL,
                                         fill=tc, tags=(f"cell_{a}_{b}",))
-                # Click handler
                 def on_click(event, pa=a, pb=b):
                     self._show_pair_history(pa, pb)
                 canvas.tag_bind(f"cell_{a}_{b}", "<Button-1>", on_click)
 
-        # Color legend
         legend_row = tk.Frame(inner, bg=theme.PANEL)
         legend_row.pack(anchor="w", pady=(10, 0))
         tk.Label(legend_row, text="Legend:", font=theme.FONT_SMALL,
-                 bg=theme.PANEL, fg=theme.TEXT_DIM).pack(side="left", padx=(0, 8))
+                 bg=theme.PANEL, fg=theme.TEXT_DIM).pack(
+                     side="left", padx=(0, 8))
         if max_count > 0:
             for step in range(min(max_count, 5) + 1):
                 cnt = step
@@ -6709,7 +10224,13 @@ class _StatsWindow(tk.Toplevel):
         return frame
 
     def _show_pair_history(self, student_a: int, student_b: int):
-        """Popup showing rounds the pair shared a table."""
+        """Popup showing rounds the pair shared a table or activity.
+        Only includes rounds that match the current mode filter."""
+        # The DB helper get_rounds_for_pair returns seating rounds only;
+        # for "activity" or "all" modes we'd also want activity rounds.
+        # Keeping this seating-only for now since the DB helper only
+        # surfaces seating rounds — if the user wants activity-level
+        # detail, the activity round list is one click away.
         rounds = db.get_rounds_for_pair(self.class_id, student_a, student_b)
         name_a = self.name_by_id.get(student_a, f"#{student_a}")
         name_b = self.name_by_id.get(student_b, f"#{student_b}")
@@ -6718,7 +10239,7 @@ class _StatsWindow(tk.Toplevel):
         dlg.title(f"{name_a} + {name_b}")
         dlg.geometry("460x380")
         dlg.configure(bg=theme.BG)
-        dlg.transient(self)
+        dlg.transient(self.winfo_toplevel())
 
         tk.Label(dlg, text=f"{name_a} + {name_b}",
                  font=theme.FONT_TITLE, bg=theme.BG, fg=theme.TEXT,
@@ -6734,14 +10255,16 @@ class _StatsWindow(tk.Toplevel):
         body.pack(fill="both", expand=True)
 
         if not rounds:
-            tk.Label(body, text="They have never sat together.",
+            tk.Label(body, text="They have never sat together (seating rounds).",
                      font=theme.FONT_BODY, bg=theme.BG,
                      fg=theme.TEXT_DIM).pack(anchor="w")
             return
 
         tk.Label(body,
-                 text=f"They have shared a table in {len(rounds)} round{'s' if len(rounds) != 1 else ''}:",
-                 font=theme.FONT_BODY, bg=theme.BG, fg=theme.TEXT).pack(anchor="w")
+                 text=f"They have shared a seating table in {len(rounds)} "
+                      f"round{'s' if len(rounds) != 1 else ''}:",
+                 font=theme.FONT_BODY, bg=theme.BG, fg=theme.TEXT).pack(
+                     anchor="w")
 
         list_frame = tk.Frame(body, bg=theme.BG)
         list_frame.pack(fill="both", expand=True, pady=(8, 0))
@@ -6764,6 +10287,241 @@ class _StatsWindow(tk.Toplevel):
                          values=(r["label"],
                                  r["created_at"][:10] if r["created_at"] else "",
                                  r["table_label"] or ""))
+
+    # ── L4: Tag respect ──────────────────────────────────────────────────
+
+    def _build_tags_section(self, parent):
+        """Card-grid summary of how well the most recent round honored
+        each non-ignore tag category. Returns None if there's nothing
+        meaningful to show."""
+        ops = db.get_tag_operations_for_class(self.class_id)
+        if not ops:
+            return None
+
+        # Latest round respecting the mode filter
+        chosen = self._get_latest_round_for_mode()
+        if not chosen:
+            return self._build_tags_empty_card(parent)
+        round_type, latest_round = chosen
+
+        # Load assignments + group by table/activity id
+        if round_type == "seating":
+            raw = db.get_assignments_for_round(latest_round["id"])
+            groups_by_id: dict = defaultdict(list)
+            group_label: dict = {}
+            for a in raw:
+                groups_by_id[a["table_id"]].append(a["student_id"])
+                group_label[a["table_id"]] = a.get("table_label") or f"#{a['table_id']}"
+        else:
+            raw = db.get_activity_assignments_for_round(latest_round["id"])
+            groups_by_id = defaultdict(list)
+            group_label = {}
+            for a in raw:
+                groups_by_id[a["activity_id"]].append(a["student_id"])
+                group_label[a["activity_id"]] = a.get("activity_name") or f"#{a['activity_id']}"
+
+        tags_by_sid = db.get_all_student_tags_for_class(self.class_id)
+
+        frame = tk.Frame(parent, bg=theme.PANEL,
+                          highlightbackground=theme.BORDER, highlightthickness=1)
+        inner = tk.Frame(frame, bg=theme.PANEL, padx=18, pady=14)
+        inner.pack(fill="x")
+
+        tk.Label(inner, text="Tag Rules — Most Recent Round",
+                 font=theme.FONT_BOLD,
+                 bg=theme.PANEL, fg=theme.TEXT).pack(anchor="w")
+
+        round_date = (latest_round.get("created_at") or "")[:10]
+        sub = f"{latest_round.get('label', '?')}  ·  {round_date}  ·  {round_type}"
+        tk.Label(inner, text=sub, font=theme.FONT_SMALL,
+                 bg=theme.PANEL, fg=theme.TEXT_DIM).pack(
+                     anchor="w", pady=(2, 10))
+
+        for op in ops:
+            self._build_tag_category_card(
+                inner, op, groups_by_id, group_label, tags_by_sid)
+
+        return frame
+
+    def _build_tags_empty_card(self, parent):
+        frame = tk.Frame(parent, bg=theme.PANEL,
+                          highlightbackground=theme.BORDER, highlightthickness=1)
+        inner = tk.Frame(frame, bg=theme.PANEL, padx=18, pady=14)
+        inner.pack(fill="x")
+        tk.Label(inner, text="Tag Rules",
+                 font=theme.FONT_BOLD,
+                 bg=theme.PANEL, fg=theme.TEXT).pack(anchor="w")
+        tk.Label(inner,
+                 text="Generate a round to see how well your tag rules are being honored.",
+                 font=theme.FONT_SMALL, bg=theme.PANEL,
+                 fg=theme.TEXT_DIM).pack(anchor="w", pady=(2, 0))
+        return frame
+
+    def _build_tag_category_card(self, parent, op: dict,
+                                    groups_by_id: dict,
+                                    group_label: dict,
+                                    tags_by_sid: dict):
+        with db.get_connection() as conn:
+            val_rows = conn.execute(
+                """SELECT id, value AS name, color FROM student_tag_values
+                   WHERE category_id=?
+                   ORDER BY sort_order, value""",
+                (op["category_id"],)).fetchall()
+        value_info: dict = {
+            r["id"]: {"name": r["name"], "color": r["color"]}
+            for r in val_rows}
+
+        all_round_sids = set()
+        for g_sids in groups_by_id.values():
+            all_round_sids.update(g_sids)
+
+        per_value: dict[int, dict[int, int]] = {
+            vid: defaultdict(int) for vid in value_info}
+        for vid in value_info:
+            for sid in all_round_sids:
+                if vid in tags_by_sid.get(sid, set()):
+                    for gid, g_sids in groups_by_id.items():
+                        if sid in g_sids:
+                            per_value[vid][gid] += 1
+                            break
+
+        op_kind = op["operation"]
+        if op_kind == "distribute":
+            verdict, verdict_color = self._verdict_distribute(
+                per_value, groups_by_id)
+            op_label = "Distribute"
+            op_color = theme.ACCENT
+        elif op_kind == "cluster":
+            verdict, verdict_color = self._verdict_cluster(per_value)
+            op_label = "Cluster"
+            op_color = theme.SUCCESS
+        elif op_kind == "keep_apart":
+            verdict, verdict_color = self._verdict_keep_apart(per_value)
+            op_label = "Keep apart"
+            op_color = theme.DANGER
+        else:
+            return
+
+        card = tk.Frame(parent, bg=theme.BG,
+                         highlightbackground=theme.BORDER,
+                         highlightthickness=1)
+        card.pack(fill="x", pady=(0, 10))
+        card_inner = tk.Frame(card, bg=theme.BG, padx=12, pady=10)
+        card_inner.pack(fill="x")
+
+        hdr = tk.Frame(card_inner, bg=theme.BG)
+        hdr.pack(fill="x")
+        tk.Label(hdr, text=op["name"], font=theme.FONT_BOLD,
+                 bg=theme.BG, fg=theme.TEXT, anchor="w").pack(side="left")
+        pill = tk.Label(hdr, text=f" {op_label} ",
+                          font=theme.FONT_SMALL,
+                          bg=op_color, fg=theme.ACCENT_TEXT, padx=6)
+        pill.pack(side="left", padx=(8, 0))
+
+        tk.Label(card_inner, text=verdict, font=theme.FONT_SMALL,
+                 bg=theme.BG, fg=verdict_color, anchor="w").pack(
+                     fill="x", pady=(4, 6))
+
+        for vid, group_counts in per_value.items():
+            if not group_counts:
+                continue
+            self._build_tag_value_row(
+                card_inner, value_info[vid], group_counts, group_label)
+
+    def _build_tag_value_row(self, parent, value: dict,
+                                group_counts: dict, group_label: dict):
+        row = tk.Frame(parent, bg=theme.BG)
+        row.pack(fill="x", pady=(2, 4))
+        head = tk.Frame(row, bg=theme.BG)
+        head.pack(fill="x")
+        vcolor = value["color"] or theme.BORDER
+        tk.Label(head, text=" ", bg=vcolor, padx=4).pack(
+            side="left", pady=2)
+        tk.Label(head, text=f"  {value['name']}", font=theme.FONT_SMALL,
+                 bg=theme.BG, fg=theme.TEXT, anchor="w").pack(side="left")
+
+        chip_container = tk.Frame(row, bg=theme.BG)
+        chip_container.pack(fill="x", padx=(18, 0), pady=(2, 0))
+
+        chip_data = []
+        for gid in sorted(group_counts, key=lambda g: group_label.get(g, "")):
+            lbl = group_label.get(gid, f"#{gid}")
+            chip_data.append(f"{lbl}: {group_counts[gid]}")
+
+        self._reflow_chips(chip_container, chip_data)
+
+    def _reflow_chips(self, container: tk.Frame, chip_texts: list):
+        COLS = 3
+        for i, text in enumerate(chip_texts):
+            row, col = divmod(i, COLS)
+            chip = tk.Label(container, text=text, font=theme.FONT_SMALL,
+                             bg=theme.GHOST_BG, fg=theme.TEXT_DIM,
+                             padx=6, pady=1)
+            chip.grid(row=row, column=col, sticky="w",
+                       padx=(0, 8), pady=2)
+
+    # ── Verdict helpers ──────────────────────────────────────────────────
+
+    def _verdict_distribute(self, per_value: dict,
+                              groups_by_id: dict) -> tuple[str, str]:
+        n_groups = len(groups_by_id)
+        if n_groups <= 1:
+            return ("(only one group)", theme.TEXT_DIM)
+        total_imbalance = 0
+        any_value = False
+        for vid, group_counts in per_value.items():
+            if not group_counts:
+                continue
+            any_value = True
+            counts = [group_counts.get(gid, 0) for gid in groups_by_id]
+            imbalance = max(counts) - min(counts)
+            total_imbalance += imbalance
+        if not any_value:
+            return ("(nobody tagged)", theme.TEXT_DIM)
+        if total_imbalance == 0:
+            return ("✓  Perfectly distributed", theme.SUCCESS)
+        elif total_imbalance <= len([1 for v in per_value.values() if v]):
+            return ("✓  Well distributed", theme.SUCCESS)
+        else:
+            return ("○  Mixed", theme.TEXT_DIM)
+
+    def _verdict_cluster(self, per_value: dict) -> tuple[str, str]:
+        total = 0
+        clustered = 0
+        for vid, group_counts in per_value.items():
+            if not group_counts:
+                continue
+            total += 1
+            if len(group_counts) == 1:
+                clustered += 1
+        if total == 0:
+            return ("(nobody tagged)", theme.TEXT_DIM)
+        if clustered == total:
+            return (f"✓  All {total} clustered", theme.SUCCESS)
+        elif clustered >= total / 2:
+            return (f"○  {clustered}/{total} clustered", theme.TEXT_DIM)
+        else:
+            return (f"○  Only {clustered}/{total} clustered", theme.TEXT_DIM)
+
+    def _verdict_keep_apart(self, per_value: dict) -> tuple[str, str]:
+        violations = 0
+        any_tagged = False
+        for vid, group_counts in per_value.items():
+            if not group_counts:
+                continue
+            any_tagged = True
+            for gid, count in group_counts.items():
+                if count > 1:
+                    violations += count * (count - 1) // 2
+        if not any_tagged:
+            return ("(nobody tagged)", theme.TEXT_DIM)
+        if violations == 0:
+            return ("✓  Fully respected", theme.SUCCESS)
+        elif violations <= 2:
+            return (f"○  {violations} violation{'s' if violations != 1 else ''}",
+                     theme.TEXT_DIM)
+        else:
+            return (f"✗  {violations} violations", theme.DANGER)
 
 
 # ── Assignment Editor Dialogs ──────────────────────────────────────────────────
@@ -7257,6 +11015,505 @@ class _AssignmentEditorDialogTableMode(tk.Toplevel):
         db.replace_assignments(self.rnd["id"], flat,
                                 mark_edited=True,
                                 new_repeat_score=repeat_score)
+        self.new_repeat_score = repeat_score
+        self.saved = True
+        self.destroy()
+
+
+class _ActivityAssignmentEditorDialog(tk.Toplevel):
+    """
+    Manual override editor for an activity round's assignments.
+
+    Mirrors _AssignmentEditorDialogTableMode but for activity rounds:
+    students are grouped by activity in cards, click to pick a student
+    and click another student (or an empty slot) to swap/move. There's
+    no "seat" concept — each activity has a capacity, that's it.
+
+    Data model: {activity_id: [student_id, ...]}. An "empty slot" at
+    an activity exists when len(students) < activity.capacity.
+
+    Operations (all undoable):
+    - Swap two students (either same-activity, which is a visual no-op,
+      or cross-activity)
+    - Move a student from one activity to an empty slot at another
+
+    Warnings:
+    - Forbidden-pair pairings end up in the same activity
+    - Pinned-activity violations (student moved off their pin)
+    - Exclusion violations (student moved to an activity they were
+      excluded from)
+    """
+    def __init__(self, parent, rnd: dict, cls: dict):
+        super().__init__(parent)
+        self.rnd     = rnd
+        self.cls     = cls
+        self.saved   = False
+        self.new_repeat_score = rnd.get("repeat_score", 0)
+
+        self.title(f"Edit Assignments — {rnd['label']}")
+        self.geometry("780x680")
+        self.configure(bg=theme.BG)
+        self.transient(parent)
+        self.grab_set()
+
+        # Load activities. Show only ones that had at least one student
+        # in this round — archived/excluded activities shouldn't appear.
+        self.activities = db.get_activities_for_class(
+            cls["id"], include_archived=False)
+        self.acts_by_id: dict = {a["id"]: a for a in self.activities}
+
+        # Working state: {activity_id: [student_id, ...]}
+        self.activity_assignments: dict[int, list[int]] = {
+            a["id"]: [] for a in self.activities}
+        raw = db.get_activity_assignments_for_round(rnd["id"])
+        for r in raw:
+            if r["activity_id"] in self.activity_assignments:
+                self.activity_assignments[r["activity_id"]].append(
+                    r["student_id"])
+
+        # Filter to activities that actually appeared in this round
+        # (active set). Activities with zero assignments are still
+        # editable destinations (empty slots), so we keep them.
+        # Drop activities not in this round's assignment scope only if
+        # they have zero capacity (shouldn't happen).
+        self.activities = [a for a in self.activities if a["capacity"] > 0]
+        self.acts_by_id = {a["id"]: a for a in self.activities}
+
+        # Student roster (active + inactive, since assignments may
+        # include students whose status changed since generation)
+        students = db.get_students_for_class(cls["id"], active_only=False)
+        self.name_by_id: dict = {s["id"]: (s.get("display") or s["name"])
+                                  for s in students}
+        self.pinned_by_id: dict = {
+            s["id"]: s.get("pinned_activity_id") for s in students}
+        # Per-student exclusions (which activities they CAN'T be in)
+        self.exclusions_by_id: dict = {}
+        for s in students:
+            self.exclusions_by_id[s["id"]] = set(
+                db.get_exclusions_for_student(s["id"]))
+        self.forbidden_pairs: set = set()
+        for c in db.get_pair_constraints(cls["id"]):
+            a, b = sorted([c["student_a"], c["student_b"]])
+            self.forbidden_pairs.add((a, b))
+
+        # Undo stack
+        self._undo_stack: list = []
+        # Click state: student_id currently picked up, or None
+        self._picked_student_id: int | None = None
+
+        self._build()
+        self.bind_all("<Command-z>", lambda e: self._undo())
+        self.bind_all("<Control-z>", lambda e: self._undo())
+        self.bind_all("<Escape>",    lambda e: self._clear_picked())
+        self.bind("<Destroy>", self._on_destroy)
+
+    def _on_destroy(self, event):
+        if event.widget is self:
+            try:
+                self.unbind_all("<Command-z>")
+                self.unbind_all("<Control-z>")
+                self.unbind_all("<Escape>")
+            except tk.TclError:
+                pass
+
+    # ── Build ─────────────────────────────────────────────────────────────
+
+    def _build(self):
+        tk.Label(self, text="Edit Activity Assignments", font=theme.FONT_TITLE,
+                 bg=theme.BG, fg=theme.TEXT, padx=24, pady=16).pack(anchor="w")
+        tk.Frame(self, bg=theme.SEP, height=1).pack(fill="x", padx=24)
+
+        # Bottom: Save / Cancel + Undo + status
+        bottom = tk.Frame(self, bg=theme.BG, padx=24, pady=14)
+        bottom.pack(side="bottom", fill="x")
+        self.status_lbl = tk.Label(bottom, text="", font=theme.FONT_SMALL,
+                                    bg=theme.BG, fg=theme.TEXT_DIM, anchor="w")
+        self.status_lbl.pack(side="bottom", anchor="w", pady=(10, 0), fill="x")
+
+        btn_row = tk.Frame(bottom, bg=theme.BG)
+        btn_row.pack(side="bottom", fill="x")
+        make_btn(btn_row, "✓ Save Changes", self._save,
+                 style="primary", padx=18, pady=9).pack(side="left")
+        make_btn(btn_row, "Cancel", self.destroy,
+                 style="ghost", padx=18, pady=9).pack(side="left", padx=10)
+        self._undo_btn = make_btn(btn_row, "↶ Undo", lambda: None,
+                                    style="ghost", padx=14, pady=9)
+        self._undo_btn.pack(side="right")
+        self._update_undo_button()
+
+        # Instructions
+        instr_frame = tk.Frame(self, bg=theme.BG, padx=24, pady=10)
+        instr_frame.pack(fill="x")
+        self.instr_lbl = tk.Label(
+            instr_frame,
+            text="Click a student to pick them up, then click another "
+                 "student to swap or an empty slot to move. Esc cancels, Cmd+Z undoes.",
+            font=theme.FONT_SMALL, bg=theme.BG, fg=theme.TEXT_DIM, anchor="w")
+        self.instr_lbl.pack(anchor="w")
+
+        # Body: scrollable container of activity cards in a wrap grid
+        container, self.body_frame = make_text_scroll_container(
+            self, padx=0, pady=0)
+        container.pack(fill="both", expand=True, padx=24, pady=(0, 12))
+        self.body_frame.bind("<Key>", lambda e: "break")
+        self.body_frame.bind("<Button-2>", lambda e: "break")
+
+        self._render_cards()
+
+    def _render_cards(self):
+        """Re-render every activity card based on current state."""
+        self.body_frame.configure(state="normal")
+        self.body_frame.delete("1.0", "end")
+        grid = tk.Frame(self.body_frame, bg=theme.BG)
+        self.body_frame.window_create("end", window=grid)
+        self.body_frame.configure(state="disabled")
+
+        COLS = 2
+        for i, a in enumerate(self.activities):
+            row, col = divmod(i, COLS)
+            card = self._build_activity_card(grid, a)
+            card.grid(row=row, column=col, sticky="nsew", padx=6, pady=6)
+            grid.grid_columnconfigure(col, weight=1, uniform="col")
+
+    def _build_activity_card(self, parent, a: dict) -> tk.Frame:
+        aid = a["id"]
+        cap = a["capacity"]
+        sids = self.activity_assignments.get(aid, [])
+        occupied = len(sids)
+
+        card = tk.Frame(parent, bg=theme.PANEL,
+                         highlightbackground=theme.BORDER,
+                         highlightthickness=1)
+        inner = tk.Frame(card, bg=theme.PANEL, padx=12, pady=10)
+        inner.pack(fill="both", expand=True)
+
+        # Header
+        hdr = tk.Frame(inner, bg=theme.PANEL)
+        hdr.pack(fill="x", pady=(0, 4))
+        tk.Label(hdr, text=a["name"], font=theme.FONT_BOLD,
+                 bg=theme.PANEL, fg=theme.TEXT, anchor="w").pack(side="left")
+        tk.Label(hdr, text=f"  ({occupied}/{cap})", font=theme.FONT_SMALL,
+                 bg=theme.PANEL, fg=theme.TEXT_DIM, anchor="w").pack(side="left")
+
+        # Student rows
+        for sid in sids:
+            self._build_student_row(inner, sid, aid)
+
+        # Empty slots (visible + clickable only if a student is picked up)
+        empty_slots = cap - occupied
+        for _ in range(empty_slots):
+            self._build_empty_row(inner, aid)
+
+        return card
+
+    def _build_student_row(self, parent, sid: int, aid: int):
+        name = self.name_by_id.get(sid, f"#{sid}")
+        is_picked = (sid == self._picked_student_id)
+        bg = theme.ACCENT if is_picked else theme.PANEL
+        fg = theme.ACCENT_TEXT if is_picked else theme.TEXT
+        prefix = "→  " if is_picked else "•  "
+
+        pin_aid = self.pinned_by_id.get(sid)
+        pin_suffix = ""
+        if pin_aid is not None:
+            # 📌 = pin satisfied here, 📌! = pin violated (student at wrong activity)
+            pin_suffix = " 📌" if pin_aid == aid else " 📌!"
+
+        row = tk.Frame(parent, bg=bg, padx=6, pady=2, cursor="hand2")
+        row.pack(fill="x", pady=1)
+        lbl = tk.Label(row, text=f"{prefix}{name}{pin_suffix}",
+                        font=theme.FONT_BODY, bg=bg, fg=fg, anchor="w",
+                        cursor="hand2")
+        lbl.pack(fill="x")
+        def on_click(_e=None, s=sid, t=aid):
+            self._on_student_click(s, t)
+        for w in (row, lbl):
+            w.bind("<Button-1>", on_click)
+
+    def _build_empty_row(self, parent, aid: int):
+        active = self._picked_student_id is not None
+        if active:
+            bg = theme.GHOST_BG
+            fg = theme.ACCENT
+            text = "+  place here"
+            cursor = "hand2"
+        else:
+            bg = theme.PANEL
+            fg = theme.TEXT_MUTED
+            text = "○  empty"
+            cursor = ""
+        row = tk.Frame(parent, bg=bg, padx=6, pady=2, cursor=cursor)
+        row.pack(fill="x", pady=1)
+        lbl = tk.Label(row, text=text, font=theme.FONT_SMALL,
+                        bg=bg, fg=fg, anchor="w", cursor=cursor)
+        lbl.pack(fill="x")
+        if active:
+            def on_click(_e=None, t=aid):
+                self._on_empty_click(t)
+            for w in (row, lbl):
+                w.bind("<Button-1>", on_click)
+
+    # ── Click handling ────────────────────────────────────────────────────
+
+    def _on_student_click(self, sid: int, aid: int):
+        if self._picked_student_id is None:
+            self._picked_student_id = sid
+            name = self.name_by_id.get(sid, f"#{sid}")
+            self.instr_lbl.configure(
+                text=f"Picked up {name}. Click another student to swap, or "
+                     f"click an empty slot to move them. Esc cancels.",
+                fg=theme.ACCENT)
+            self._render_cards()
+        elif sid == self._picked_student_id:
+            self._clear_picked()
+        else:
+            self._swap_students(self._picked_student_id, sid)
+
+    def _on_empty_click(self, target_aid: int):
+        if self._picked_student_id is None:
+            return
+        self._move_student_to_activity(self._picked_student_id, target_aid)
+
+    def _clear_picked(self):
+        self._picked_student_id = None
+        self.instr_lbl.configure(
+            text="Click a student to pick them up, then click another "
+                 "student to swap or an empty slot to move. Esc cancels, Cmd+Z undoes.",
+            fg=theme.TEXT_DIM)
+        self._render_cards()
+
+    # ── Operations ────────────────────────────────────────────────────────
+
+    def _swap_students(self, sid_a: int, sid_b: int):
+        aid_a = self._activity_of(sid_a)
+        aid_b = self._activity_of(sid_b)
+        if aid_a is None or aid_b is None:
+            self._clear_picked()
+            return
+        if aid_a == aid_b:
+            self.status_lbl.configure(
+                text="Those students are already in the same activity.",
+                fg=theme.TEXT_DIM)
+            self._clear_picked()
+            return
+
+        warnings = self._check_warnings(sid_a, aid_a, sid_b, aid_b)
+        if warnings and not self._confirm_warnings(warnings):
+            self._clear_picked()
+            return
+
+        self.activity_assignments[aid_a].remove(sid_a)
+        self.activity_assignments[aid_b].remove(sid_b)
+        self.activity_assignments[aid_a].append(sid_b)
+        self.activity_assignments[aid_b].append(sid_a)
+
+        name_a = self.name_by_id.get(sid_a, f"#{sid_a}")
+        name_b = self.name_by_id.get(sid_b, f"#{sid_b}")
+        desc = f"Swap {name_a} ↔ {name_b}"
+
+        def _reverse(a=sid_a, b=sid_b, aa=aid_a, ab=aid_b):
+            self.activity_assignments[aa].remove(b)
+            self.activity_assignments[ab].remove(a)
+            self.activity_assignments[aa].append(a)
+            self.activity_assignments[ab].append(b)
+        self._undo_stack.append((_reverse, desc))
+
+        self._clear_picked()
+        self._update_undo_button()
+
+    def _move_student_to_activity(self, sid: int, target_aid: int):
+        src_aid = self._activity_of(sid)
+        if src_aid is None:
+            self._clear_picked()
+            return
+        if src_aid == target_aid:
+            self._clear_picked()
+            return
+        target_cap = self.acts_by_id[target_aid]["capacity"]
+        if len(self.activity_assignments[target_aid]) >= target_cap:
+            messagebox.showwarning(
+                "Activity Full",
+                f"{self.acts_by_id[target_aid]['name']} has no empty slots.",
+                parent=self)
+            self._clear_picked()
+            return
+
+        warnings = self._check_warnings(sid, src_aid, None, target_aid)
+        if warnings and not self._confirm_warnings(warnings):
+            self._clear_picked()
+            return
+
+        self.activity_assignments[src_aid].remove(sid)
+        self.activity_assignments[target_aid].append(sid)
+
+        name = self.name_by_id.get(sid, f"#{sid}")
+        src_lbl = self.acts_by_id[src_aid]["name"]
+        tgt_lbl = self.acts_by_id[target_aid]["name"]
+        desc = f"Move {name}: {src_lbl} → {tgt_lbl}"
+
+        def _reverse(s=sid, src=src_aid, tgt=target_aid):
+            self.activity_assignments[tgt].remove(s)
+            self.activity_assignments[src].append(s)
+        self._undo_stack.append((_reverse, desc))
+
+        self._clear_picked()
+        self._update_undo_button()
+
+    def _activity_of(self, sid: int) -> int | None:
+        for aid, sids in self.activity_assignments.items():
+            if sid in sids:
+                return aid
+        return None
+
+    # ── Warnings ──────────────────────────────────────────────────────────
+
+    def _check_warnings(self, sid_a, aid_a, sid_b, aid_b) -> list:
+        warnings = []
+
+        def pin_violation(sid, new_aid):
+            if sid is None:
+                return None
+            pinned = self.pinned_by_id.get(sid)
+            if pinned is not None and pinned != new_aid:
+                name = self.name_by_id.get(sid, f"#{sid}")
+                act_lbl = self.acts_by_id.get(pinned, {}).get(
+                    "name", f"Activity #{pinned}")
+                return (f"📌 {name} is pinned to {act_lbl}. "
+                        f"This move violates that pin.")
+            return None
+
+        v = pin_violation(sid_a, aid_b)
+        if v: warnings.append(v)
+        v = pin_violation(sid_b, aid_a)
+        if v: warnings.append(v)
+
+        # Exclusion violations
+        def exclusion_violation(sid, new_aid):
+            if sid is None:
+                return None
+            excl = self.exclusions_by_id.get(sid, set())
+            if new_aid in excl:
+                name = self.name_by_id.get(sid, f"#{sid}")
+                act_lbl = self.acts_by_id.get(new_aid, {}).get(
+                    "name", f"Activity #{new_aid}")
+                return (f"⛔ {name} is excluded from {act_lbl}. "
+                        f"This move violates that exclusion.")
+            return None
+
+        v = exclusion_violation(sid_a, aid_b)
+        if v: warnings.append(v)
+        v = exclusion_violation(sid_b, aid_a)
+        if v: warnings.append(v)
+
+        # Forbidden pairs at destination activities
+        def students_at_activity_after(target_aid):
+            result = set(self.activity_assignments[target_aid])
+            if sid_a is not None and aid_a == target_aid:
+                result.discard(sid_a)
+            if sid_b is not None and aid_b == target_aid:
+                result.discard(sid_b)
+            if sid_a is not None and aid_b == target_aid:
+                result.add(sid_a)
+            if sid_b is not None and aid_a == target_aid:
+                result.add(sid_b)
+            return result
+
+        def check_forbidden_at(target_aid):
+            students_here = students_at_activity_after(target_aid)
+            for a, b in self.forbidden_pairs:
+                if a in students_here and b in students_here:
+                    name_a = self.name_by_id.get(a, f"#{a}")
+                    name_b = self.name_by_id.get(b, f"#{b}")
+                    act_lbl = self.acts_by_id.get(target_aid, {}).get(
+                        "name", f"Activity #{target_aid}")
+                    warnings.append(
+                        f"🚫 {name_a} and {name_b} are marked never-together, "
+                        f"but this puts them both at {act_lbl}.")
+
+        if aid_a is not None:
+            check_forbidden_at(aid_a)
+        if aid_b is not None and aid_b != aid_a:
+            check_forbidden_at(aid_b)
+
+        return warnings
+
+    def _confirm_warnings(self, warnings: list) -> bool:
+        msg = "This change creates the following issue(s):\n\n"
+        msg += "\n".join(f"  • {w}" for w in warnings)
+        msg += "\n\nContinue anyway?"
+        return messagebox.askyesno("Confirm Change", msg, parent=self)
+
+    # ── Undo ──────────────────────────────────────────────────────────────
+
+    def _undo(self):
+        if not self._undo_stack:
+            return
+        reverse_fn, desc = self._undo_stack.pop()
+        reverse_fn()
+        self._clear_picked()
+        self._update_undo_button()
+        self.status_lbl.configure(text=f"Undid: {desc}", fg=theme.TEXT_DIM)
+
+    def _update_undo_button(self):
+        if not hasattr(self, "_undo_btn") or not self._undo_btn.winfo_exists():
+            return
+        if self._undo_stack:
+            last_desc = self._undo_stack[-1][1]
+            if len(last_desc) > 32:
+                last_desc = last_desc[:29] + "…"
+            self._undo_btn.configure(bg=theme.BG, fg=theme.TEXT, cursor="hand2",
+                                      text=f"↶ Undo: {last_desc}")
+            self._undo_btn._btn_bg    = theme.BG
+            self._undo_btn._btn_hover = theme.SEP
+            self._undo_btn._command   = self._undo
+        else:
+            self._undo_btn.configure(bg=theme.GHOST_BG, fg=theme.TEXT_MUTED,
+                                      cursor="", text="↶ Undo")
+            self._undo_btn._btn_bg    = theme.GHOST_BG
+            self._undo_btn._btn_hover = theme.GHOST_BG
+            self._undo_btn._command   = lambda: None
+
+    # ── Save ──────────────────────────────────────────────────────────────
+
+    def _save(self):
+        if not self._undo_stack:
+            self.destroy()
+            return
+
+        # Recompute pair-repeat score against full activity history
+        # MINUS this round (the round's own contribution must be
+        # subtracted so we don't double-count).
+        full_history = db.get_activity_pair_history(self.cls["id"])
+        on_disk = db.get_activity_assignments_for_round(self.rnd["id"])
+        on_disk_by_act: dict = defaultdict(list)
+        for r in on_disk:
+            on_disk_by_act[r["activity_id"]].append(r["student_id"])
+        prior_history = dict(full_history)
+        for sids in on_disk_by_act.values():
+            for i in range(len(sids)):
+                for j in range(i + 1, len(sids)):
+                    a, b = sorted([sids[i], sids[j]])
+                    prior_history[(a, b)] = prior_history.get((a, b), 0) - 1
+                    if prior_history[(a, b)] <= 0:
+                        del prior_history[(a, b)]
+
+        repeat_score = 0
+        for sids in self.activity_assignments.values():
+            for i in range(len(sids)):
+                for j in range(i + 1, len(sids)):
+                    a, b = sorted([sids[i], sids[j]])
+                    repeat_score += prior_history.get((a, b), 0)
+
+        # Flatten and save
+        flat = []
+        for aid, sids in self.activity_assignments.items():
+            for sid in sids:
+                flat.append((sid, aid))
+
+        db.replace_activity_assignments(
+            self.rnd["id"], flat,
+            mark_edited=True,
+            new_repeat_score=repeat_score)
         self.new_repeat_score = repeat_score
         self.saved = True
         self.destroy()

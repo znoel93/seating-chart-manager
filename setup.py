@@ -47,6 +47,7 @@ INCLUDES = [
     "optimizer_table_mode",
     "layout_io",
     "seating_distribution",
+    "activity_optimizer",
 ]
 
 # Packages py2app would include but shouldn't — none in our case.
@@ -69,8 +70,8 @@ OPTIONS = {
         "CFBundleName":            "Seating Chart Manager",
         "CFBundleDisplayName":     "Seating Chart Manager",
         "CFBundleIdentifier":      "com.seatingchartmanager.app",
-        "CFBundleShortVersionString": "1.0.0",
-        "CFBundleVersion":         "1.0.0",
+        "CFBundleShortVersionString": "2.0.0",
+        "CFBundleVersion":         "2.0.0",
         # LSMinimumSystemVersion: the lowest macOS that can run the
         # bundled Python. 11.0 (Big Sur) is a safe floor for Apple
         # Silicon-only builds; older macOS predates the M1 anyway.

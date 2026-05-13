@@ -67,6 +67,7 @@ def optimise_seating(
     forbidden_pairs: list[tuple[int, int]] | None = None,
     time_limit_seconds: int | None = 30,
     seat_history: dict[tuple[int, int], int] | None = None,
+    tag_pair_costs: list[tuple[int, int, int]] | None = None,
 ) -> SeatingResult:
     """Solve the seat assignment ILP.
 
@@ -82,10 +83,19 @@ def optimise_seating(
         of letting CBC's internal ordering anchor the same student to
         the same seat every time.
 
+    tag_pair_costs: list of (sid_a, sid_b, weight_delta) — soft costs
+        injected by the tag system. Unlike pair-history (which is
+        adjacency-weighted at the SEAT-PAIR level), tag costs operate
+        at the TABLE level: both students at the same table incurs
+        the cost regardless of which specific seats. We add a separate
+        set of y_table variables for these, linearized via the table's
+        seat-sum.
+
     time_limit_seconds: hard wall-clock cap on solver runtime. Default 30s.
     """
     forbidden_pairs = forbidden_pairs or []
     seat_history   = seat_history or {}
+    tag_pair_costs = tag_pair_costs or []
 
     if not students:
         return SeatingResult(assignments=[], total_repeat_score=0, status="Optimal")
@@ -249,7 +259,76 @@ def optimise_seating(
             if stu_id in s_id_set and seat_id in seat_ids and count > 0:
                 seat_terms.append(SEAT_HISTORY_WEIGHT * count * x[stu_id][seat_id])
 
-    objective_terms = cost_terms + seat_terms
+    # ── Tag operations: pair-level y-variables ──────────────────────────────
+    # Unlike pair-history (which uses adjacent-SEAT y-vars), tag costs
+    # operate at the TABLE level: the optimizer is encouraged or
+    # discouraged from putting two students at the same table
+    # regardless of which specific seats. We add ONE binary y_tag[a,b]
+    # per pair — the indicator "do a and b share ANY table this round"
+    # is what matters; the cost fires once regardless of which table.
+    #
+    # Linearization (lower bound only — we're minimizing, so the
+    # solver naturally sets y = 0 when none of the LBs force it to 1):
+    #   For each table t with seat list S:
+    #     Let SA = sum(x[a][k] for k in S), SB = sum(x[b][k] for k in S).
+    #     SA, SB ∈ {0,1} due to the "at most one seat per student"
+    #     constraint, so y_tag >= SA + SB - 1 forces y_tag = 1 when
+    #     both students occupy seats in S.
+    #
+    # This is a major variable-count reduction vs the previous per-
+    # table scheme: for N tables and P tagged pairs, it cuts y_tag
+    # vars from N×P to P, dramatically improving solver time.
+    #
+    # Coefficient threshold: pairs whose net cost is below this don't
+    # meaningfully shift the solution; pruning them frees the solver
+    # from useless branching. Default 10 means a tag-distribute pair
+    # (weight 30) survives but pairs with near-zero net cost (e.g. a
+    # cluster discount offsetting a distribute charge) don't.
+    forbidden_set = set()
+    for (a, b) in forbidden_pairs:
+        forbidden_set.add((a, b))
+        forbidden_set.add((b, a))
+
+    tag_coeff: dict[tuple[int, int], int] = {}
+    for (a, b, delta) in tag_pair_costs:
+        if a not in s_id_set or b not in s_id_set:
+            continue
+        if (a, b) in forbidden_set:
+            continue
+        key = (a, b) if a < b else (b, a)
+        tag_coeff[key] = tag_coeff.get(key, 0) + delta
+
+    MIN_TAG_COST = 10
+
+    tag_terms = []
+    for (a, b), coeff in tag_coeff.items():
+        if abs(coeff) < MIN_TAG_COST:
+            continue
+        if coeff > 0:
+            # Positive: one any-table indicator per pair, LB only
+            y_tag = pulp.LpVariable(f"yt_{a}_{b}", cat="Binary")
+            for tid, seat_list in seats_by_table.items():
+                SA = pulp.lpSum(x[a][k] for k in seat_list)
+                SB = pulp.lpSum(x[b][k] for k in seat_list)
+                prob += y_tag >= SA + SB - 1
+            tag_terms.append(coeff * y_tag)
+        else:
+            # Negative (cluster discount): per-table y-vars with full
+            # bounds. The solver wants y=1 to claim the discount, so
+            # we need UB constraints that only let y=1 when both
+            # students are actually at this table.
+            # Cluster pairs are typically small (close-knit buddies),
+            # so the per-table multiplier remains bounded.
+            for tid, seat_list in seats_by_table.items():
+                y_c = pulp.LpVariable(f"yc_{a}_{b}_{tid}", cat="Binary")
+                SA = pulp.lpSum(x[a][k] for k in seat_list)
+                SB = pulp.lpSum(x[b][k] for k in seat_list)
+                prob += y_c <= SA
+                prob += y_c <= SB
+                prob += y_c >= SA + SB - 1
+                tag_terms.append(coeff * y_c)
+
+    objective_terms = cost_terms + seat_terms + tag_terms
     if objective_terms:
         prob += pulp.lpSum(objective_terms)
     else:
